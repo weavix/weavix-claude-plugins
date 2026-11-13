@@ -57,7 +57,9 @@ async function fakeBlobServer(status = () => 201) {
         req.on('data', c => chunks.push(c));
         req.on('end', () => {
             puts.push({ method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks) });
-            res.statusCode = status(req);
+            const r = status(req);
+            res.statusCode = typeof r === 'number' ? r : r.status;
+            if (typeof r === 'object' && r.code) res.setHeader('x-ms-error-code', r.code);
             res.end();
         });
     });
@@ -167,7 +169,7 @@ test('encodeParquet nulls a token value that is not a number instead of failing 
     assert.equal(back[0].INPUT_TOKENS, undefined);
 });
 
-test('uploadBlob sends a create-only block blob PUT and treats 201 and 409 as success', async () => {
+test('uploadBlob sends a create-only block blob PUT and treats 201, 409 and a create-only overwrite 403 as success', async () => {
     let next = 201;
     const srv = await fakeBlobServer(() => next);
     try {
@@ -175,9 +177,11 @@ test('uploadBlob sends a create-only block blob PUT and treats 201 and 409 as su
         const r1 = await new Promise(r => uploadBlob(url, Buffer.from('PAR1'), (ok, s) => r({ ok, s }), 2000));
         next = 409;
         const r2 = await new Promise(r => uploadBlob(url, Buffer.from('PAR1'), (ok, s) => r({ ok, s }), 2000));
-        next = 403;
+        next = { status: 403, code: 'UnauthorizedBlobOverwrite' };
         const r3 = await new Promise(r => uploadBlob(url, Buffer.from('PAR1'), (ok, s) => r({ ok, s }), 2000));
-        assert.deepEqual([r1, r2, r3], [{ ok: true, s: 201 }, { ok: true, s: 409 }, { ok: false, s: 403 }]);
+        next = { status: 403, code: 'AuthorizationPermissionMismatch' };
+        const r4 = await new Promise(r => uploadBlob(url, Buffer.from('PAR1'), (ok, s) => r({ ok, s }), 2000));
+        assert.deepEqual([r1, r2, r3, r4], [{ ok: true, s: 201 }, { ok: true, s: 409 }, { ok: true, s: 403 }, { ok: false, s: 403 }]);
         const h = srv.puts[0].headers;
         assert.equal(srv.puts[0].method, 'PUT');
         assert.equal(h['x-ms-blob-type'], 'BlockBlob');

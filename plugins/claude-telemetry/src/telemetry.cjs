@@ -12,7 +12,7 @@
  * Each flushed batch is encoded as parquet (dist/parquet-writer.cjs, loaded only at flush)
  * and PUT to <sas_url>/claudecodeevents/<batch>-<n>.parquet with a create-only container
  * SAS; Snowpipe loads it. The blob name is fixed per batch and the PUT is If-None-Match: *,
- * so a retried upload is a no-op (409) rather than a duplicate.
+ * so a retried upload is a no-op (the blob already exists) rather than a duplicate.
  *
  * Every event also carries where it ran — REPOSITORY / WORKFLOW / BRANCH (CI env
  * vars in Actions, the local git checkout otherwise) — plus the client ENTRYPOINT
@@ -679,8 +679,19 @@ function blobUrlFor(sasUrl, id, part) {
 }
 
 /**
- * PUT one parquet file as a block blob. done(true) on 201, and on 409 (the blob already exists
- * because an earlier attempt landed), so a retried batch is idempotent. Never throws.
+ * Whether a failed PUT means the blob is already there: 409 BlobAlreadyExists, or the 403
+ * UnauthorizedBlobOverwrite a create-only SAS returns for an existing blob.
+ * @param {number} status HTTP status
+ * @param {import('http').IncomingHttpHeaders} headers response headers
+ */
+function alreadyExists(status, headers) {
+    const code = String(headers['x-ms-error-code'] || '');
+    return status === 409 || (status === 403 && code === 'UnauthorizedBlobOverwrite');
+}
+
+/**
+ * PUT one parquet file as a block blob. done(true) on 201, and when the blob already exists
+ * because an earlier attempt landed (see alreadyExists), so a retried batch is idempotent. Never throws.
  * @param {URL} url blob URL with SAS
  * @param {Buffer} body parquet bytes
  * @param {(ok: boolean, status?: number) => void} done
@@ -705,7 +716,7 @@ function uploadBlob(url, body, done, timeoutMs) {
         }, res => {
             const status = res.statusCode;
             res.resume();
-            res.on('end', () => finish((status >= 200 && status < 300) || status === 409, status));
+            res.on('end', () => finish((status >= 200 && status < 300) || alreadyExists(status, res.headers), status));
             res.on('error', () => finish(false, status));
         });
     } catch {
@@ -941,6 +952,6 @@ module.exports = {
     SPOOL_MAX_BYTES, SPOOL_HOLD_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
     repoFromRemote, resolveOrigin, turnTokens, initTokenOffset, commitTokenOffset,
     originCacheFile, cleanupSessionState, usageInt, MIN_ROW_WIDTH, STATE_RETENTION_MS,
-    resolveBlobConfig, blobConfigFilePath, batchId, blobUrlFor, uploadBlob,
+    resolveBlobConfig, blobConfigFilePath, batchId, blobUrlFor, uploadBlob, alreadyExists,
     flushParquetBatches, flushAll, logFailure, PARQUET_COLUMN_TYPES, PARQUET_ENTITY, MAX_ROWS_PER_PARQUET,
 };

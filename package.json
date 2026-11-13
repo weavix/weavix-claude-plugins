@@ -1,0 +1,17 @@
+{
+  "name": "weavix-claude-plugins",
+  "private": true,
+  "description": "weavix Claude Code plugin marketplace. Build tooling only; plugins ship their bundled dist/ and need no install.",
+  "scripts": {
+    "build": "node plugins/claude-telemetry/scripts/build.cjs",
+    "check-dist": "node plugins/claude-telemetry/scripts/build.cjs --check",
+    "test": "node plugins/claude-telemetry/test/telemetry.test.cjs && node plugins/claude-telemetry/test/parquet.test.cjs && node plugins/claude-telemetry/test/guard.test.cjs"
+  },
+  "devDependencies": {
+    "@dsnp/parquetjs": "1.8.7",
+    "esbuild": "0.20.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

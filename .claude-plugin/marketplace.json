@@ -1,0 +1,12 @@
+{
+  "name": "weavix",
+  "owner": { "name": "weavix" },
+  "metadata": { "description": "weavix Claude Code plugins: usage telemetry and shared team tooling." },
+  "plugins": [
+    {
+      "name": "claude-telemetry",
+      "source": "./plugins/claude-telemetry",
+      "description": "Claude Code usage telemetry as parquet to blob storage, ingested into WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS."
+    }
+  ]
+}

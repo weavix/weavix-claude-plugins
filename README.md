@@ -6,7 +6,7 @@ Claude Code plugin marketplace for weavix. Add it once and every Claude Code ses
 
 | Plugin | What it does |
 | --- | --- |
-| `claude-telemetry` | Reports Claude Code usage metadata (sessions, prompts, turns, tokens, model, subagents, skills) as parquet to blob storage. Snowpipe loads it into `WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS`. Never captures prompt or response text. |
+| `claude-telemetry` | Reports Claude Code usage metadata (sessions, prompts, turns, tokens, model, subagents, skills) as parquet to the `claude-telemetry` blob container. Snowpipe loads it into `WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS`. Never captures prompt or response text. |
 
 ## Enabling it
 
@@ -34,12 +34,17 @@ bash "<plugin root>/scripts/setup.sh"
 
 When the guard is on, Claude prints the exact command. It reads the upload URL from Key Vault (`wv-prod-secrets` / `CLAUDE-TELEMETRY-SAS-URL`, needs `az login` and read access) and writes `~/.claude/telemetry.json` (mode 0600).
 
-CI and cloud agents set the URL as a secret env var instead:
+CI and cloud agents set the URL as a secret env var instead. This repo is internal, so a job's own `GITHUB_TOKEN` cannot clone it; point git at a read-only token first:
 
 ```yaml
-env:
-  CLAUDE_TELEMETRY_SAS_URL: ${{ secrets.CLAUDE_TELEMETRY_SAS_URL }}
-  CLAUDE_AI_TELEMETRY_ENV: ci
+- run: git config --global url."https://x-access-token:${{ secrets.CLAUDE_PLUGINS_READ_TOKEN }}@github.com/weavix/weavix-claude-plugins".insteadOf "https://github.com/weavix/weavix-claude-plugins"
+- uses: anthropics/claude-code-action@v1
+  env:
+    CLAUDE_TELEMETRY_SAS_URL: ${{ secrets.CLAUDE_TELEMETRY_SAS_URL }}
+    CLAUDE_AI_TELEMETRY_ENV: ci
+  with:
+    plugin_marketplaces: https://github.com/weavix/weavix-claude-plugins.git
+    plugins: claude-telemetry@weavix
 ```
 
 CI is detected automatically and flushes in-process before the job exits.
@@ -48,10 +53,10 @@ CI is detected automatically and flushes in-process before the job exits.
 
 - **Capture:** each hook event becomes one metadata row, appended to a spool file under the system temp dir.
 - **Flush:** on `SessionEnd`, or when the spool passes 128 KB, the batch is encoded as parquet and uploaded to `<sas path>/claudecodeevents/<batch id>-<part>.parquet`.
-- **Credentials:** the SAS is create-only, scoped to the `claude/` folder of the `parquet` container. It cannot read, list, overwrite or delete.
+- **Credentials:** the SAS is container-scoped, create-only (`sp=c`) on the dedicated `claude-telemetry` container in `weavixdataplatformprodsa`. It cannot read, list, overwrite or delete, and cannot reach the `parquet` container other pipes ingest. A SAS past its `se` expiry counts as unconfigured: the guard blocks and uploads pause until setup is re-run.
 - **Retries:** a failed upload keeps its batch, which is retried after 60 s and dropped after 24 h. Blob names are fixed per batch and uploads use `If-None-Match: *`, so a retry never duplicates rows.
-- **Errors:** failures are written to `errors.log` beside the spool. That log holds the sink and HTTP status only, never the URL.
-- **Ingest:** `parquet-compactor` merges `claude/` into `snowflake-infeed/claude/`, and the Snowpipe in the data repo (`migrations/ai/telemetry`) loads it.
+- **Errors:** failures are written to `errors.log` beside the spool. That log holds the HTTP status or reason only, never the URL.
+- **Ingest:** Snowpipe `TELEMETRY.CLAUDE_CODE_EVENTS_PIPE` loads straight from the container, defined in the data repo under `migrations/ai/telemetry`. There is no compactor in between.
 
 ### Settings
 
@@ -64,9 +69,17 @@ CI is detected automatically and flushes in-process before the job exits.
 | `CLAUDE_AI_TELEMETRY_ENV` | `ENVIRONMENT` column value (default `$TARGET` or `local`) |
 | `CLAUDE_AI_TELEMETRY_ACTOR` | `CLIENT_USER` override (default `$GITHUB_ACTOR` or `$USER`) |
 | `CLAUDE_SF_SYNC` | `1` flush in-process, `0` flush in a detached child (default: in-process under CI) |
-| `CLAUDE_TELEMETRY_SNOWFLAKE` | `0` turns off the legacy direct-to-Snowflake writer |
 
-The legacy writer runs alongside parquet only on machines that still have a Snowflake connector (`~/.snowflake/claude-telemetry.json`), until the pipe is proven.
+## Rotating the upload SAS (DevOps)
+
+The SAS is signed with the storage account key, so rotating that key revokes it. Issue one for a year:
+
+```sh
+az storage container generate-sas --account-name weavixdataplatformprodsa --name claude-telemetry \
+  --permissions c --expiry "$(date -u -v+1y +%Y-%m-%dT%H:%MZ)" --https-only --auth-mode key -o tsv
+```
+
+Store `https://weavixdataplatformprodsa.blob.core.windows.net/claude-telemetry?<sas>` as `CLAUDE-TELEMETRY-SAS-URL` in `wv-prod-secrets`, and as the `CLAUDE_TELEMETRY_SAS_URL` GitHub secret. Machines pick it up the next time they run `setup.sh`.
 
 ## Developing
 

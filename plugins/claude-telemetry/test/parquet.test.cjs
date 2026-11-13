@@ -14,8 +14,8 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const { ParquetReader } = require('@dsnp/parquetjs');
 const {
-    resolveBlobConfig, snowflakeEnabled, spoolPath, appendSpool, claimBatches, batchId, blobUrlFor,
-    uploadBlob, flushParquetBatches, logFailure, toRow, buildEvent, COLUMNS, PARQUET_COLUMN_TYPES,
+    resolveBlobConfig, spoolPath, appendSpool, claimBatches, batchId, blobUrlFor,
+    uploadBlob, flushParquetBatches, flushAll, logFailure, toRow, buildEvent, COLUMNS, PARQUET_COLUMN_TYPES,
     PARQUET_ENTITY, MAX_ROWS_PER_PARQUET, ORPHAN_RETRY_AFTER_MS,
 } = require('../src/telemetry.cjs');
 const { encodeParquet } = require('../dist/parquet-writer.cjs');
@@ -89,30 +89,49 @@ test('resolveBlobConfig: an unreadable or invalid config file is treated as abse
     assert.equal(resolveBlobConfig({ CLAUDE_TELEMETRY_CONFIG: file }), null);
 });
 
-test('snowflakeEnabled: on with a connector, off without one or with CLAUDE_TELEMETRY_SNOWFLAKE=0', () => {
-    assert.equal(snowflakeEnabled({ account: 'a' }, {}), true);
-    assert.equal(snowflakeEnabled({ account: 'a' }, { CLAUDE_TELEMETRY_SNOWFLAKE: '0' }), false);
-    assert.equal(snowflakeEnabled(null, {}), false);
+test('resolveBlobConfig reports expiry from the SAS se parameter', () => {
+    const at = Date.parse('2027-01-01T00:00:00Z');
+    const url = 'https://a.example/p?se=2027-01-01T00%3A00%3A00Z&sp=c&sig=x';
+    assert.deepEqual(
+        [resolveBlobConfig({ ...NO_FILE, CLAUDE_TELEMETRY_SAS_URL: url }, at - 1).expired,
+            resolveBlobConfig({ ...NO_FILE, CLAUDE_TELEMETRY_SAS_URL: url }, at).expired],
+        [false, true],
+    );
+    assert.equal(resolveBlobConfig({ ...NO_FILE, CLAUDE_TELEMETRY_SAS_URL: SAS }).expired, false);
+    assert.equal(resolveBlobConfig({ ...NO_FILE, CLAUDE_TELEMETRY_SAS_URL: SAS }).expiresAt, null);
 });
 
-test('spoolPath: parquet spool is separate, snowflake keeps its legacy name', () => {
-    const env = { CLAUDE_SF_SPOOL: '/t/spool.ada.ndjson' };
-    assert.equal(spoolPath(env), '/t/spool.ada.ndjson');
-    assert.equal(spoolPath(env, 'snowflake'), '/t/spool.ada.ndjson');
-    assert.equal(spoolPath(env, 'parquet'), '/t/spool.ada.parquet.ndjson');
-});
-
-test('claimBatches on one sink never picks up the other sink\'s batches', () => {
+test('flushAll keeps batches and logs when the SAS has expired', async () => {
     const dir = tmp();
-    const env = { CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.ndjson') };
-    appendSpool(spoolPath(env, 'snowflake'), sampleRow());
-    appendSpool(spoolPath(env, 'parquet'), sampleRow());
+    const prev = process.env.CLAUDE_SF_SPOOL;
+    process.env.CLAUDE_SF_SPOOL = path.join(dir, 'spool.ada.parquet.ndjson');
+    try {
+        appendSpool(process.env.CLAUDE_SF_SPOOL, sampleRow());
+        const files = claimBatches(process.env.CLAUDE_SF_SPOOL, Date.now(), '77777777-0000-4000-8000-000000000000');
+        await new Promise(r => flushAll({ sasUrl: SAS, expired: true }, files, { timeoutMs: 100, budgetMs: 100 }, r));
+        assert.ok(fs.existsSync(files[0]));
+        assert.match(fs.readFileSync(path.join(dir, 'errors.log'), 'utf8'), /parquet sas-expired/);
+    } finally {
+        if (prev === undefined) delete process.env.CLAUDE_SF_SPOOL; else process.env.CLAUDE_SF_SPOOL = prev;
+    }
+});
+
+test('spoolPath is named apart from the legacy Snowflake hook spool', () => {
+    assert.equal(spoolPath({ CLAUDE_SF_SPOOL: '/t/x.ndjson' }), '/t/x.ndjson');
+    assert.match(spoolPath({ USER: 'ada' }), /claude-telemetry\/spool\.ada\.parquet\.ndjson$/);
+});
+
+test('claimBatches on the parquet spool never adopts the legacy hook\'s batches', () => {
+    const dir = tmp();
+    const legacy = path.join(dir, 'spool.ada.ndjson');
+    const pq = path.join(dir, 'spool.ada.parquet.ndjson');
+    appendSpool(legacy, sampleRow());
+    appendSpool(pq, sampleRow());
     const old = Date.now() - ORPHAN_RETRY_AFTER_MS * 2;
-    const sf = claimBatches(spoolPath(env, 'snowflake'), old, 'aaaa');
-    const pq = claimBatches(spoolPath(env, 'parquet'), Date.now(), 'bbbb');
-    assert.equal(sf.length, 1);
-    assert.equal(pq.length, 1);
-    assert.ok(pq.every(f => path.basename(f).startsWith('spool.ada.parquet.ndjson.batch.')));
+    claimBatches(legacy, old, 'aaaa');
+    const claimed = claimBatches(pq, Date.now(), 'bbbb');
+    assert.equal(claimed.length, 1);
+    assert.ok(claimed.every(f => path.basename(f).startsWith('spool.ada.parquet.ndjson.batch.')));
 });
 
 test('batchId is stable when an orphaned batch is re-adopted', () => {
@@ -280,15 +299,16 @@ function runHook(env, payload) {
 }
 
 test('end to end: a session flushes one parquet file with every event and no prompt text', async () => {
+    // A legacy Snowflake connector in the env must not matter: the plugin is parquet only.
     const dir = tmp();
     const srv = await fakeBlobServer();
     try {
         const env = {
             PATH: process.env.PATH, HOME: dir, USER: 'ada',
-            CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.ndjson'),
-            CLAUDE_SNOWFLAKE_CONFIG: path.join(dir, 'none.json'),
+            CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.parquet.ndjson'),
             CLAUDE_TELEMETRY_SAS_URL: srv.base,
             CLAUDE_SF_SYNC: '1',
+            SNOWFLAKE_ACCOUNT: 'acct', SNOWFLAKE_USER: 'svc', SNOWFLAKE_PRIVATE_KEY: 'not-a-key',
         };
         const base = { session_id: 'e2e-1', cwd: dir };
         for (const p of [
@@ -305,7 +325,6 @@ test('end to end: a session flushes one parquet file with every event and no pro
         const rows = await readParquet(srv.puts[0].body);
         assert.deepEqual(rows.map(r => r.HOOK_EVENT), ['SessionStart', 'UserPromptSubmit', 'SessionEnd']);
         assert.ok(rows.every(r => r.SESSION_ID === 'e2e-1' && r.CLIENT_USER === 'ada'));
-        assert.ok(!fs.existsSync(path.join(dir, 'spool.ada.ndjson')), 'no snowflake spool without a connector');
         assert.deepEqual(fs.readdirSync(dir).filter(f => f.includes('.batch.')), []);
     } finally { await srv.close(); }
 });
@@ -314,14 +333,13 @@ test('end to end: an unreachable endpoint keeps the batch and logs the failure',
     const dir = tmp();
     const env = {
         PATH: process.env.PATH, HOME: dir, USER: 'ada',
-        CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.ndjson'),
-        CLAUDE_SNOWFLAKE_CONFIG: path.join(dir, 'none.json'),
+        CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.parquet.ndjson'),
         CLAUDE_TELEMETRY_SAS_URL: 'http://127.0.0.1:1/parquet/claude?sig=SECRETSIG',
         CLAUDE_SF_SYNC: '1',
     };
     const r = await runHook(env, { session_id: 'e2e-2', cwd: dir, hook_event_name: 'SessionEnd' });
     assert.equal(r.code, 0);
-    assert.equal(fs.readdirSync(dir).filter(f => f.includes('.parquet.ndjson.batch.')).length, 1);
+    assert.equal(fs.readdirSync(dir).filter(f => f.includes('.batch.')).length, 1);
     const log = fs.readFileSync(path.join(dir, 'errors.log'), 'utf8');
     assert.match(log, /parquet upload-failed/);
     assert.ok(!log.includes('SECRETSIG'));
@@ -331,8 +349,7 @@ test('end to end: no sink configured is a silent no-op', async () => {
     const dir = tmp();
     const r = await runHook({
         PATH: process.env.PATH, HOME: dir, USER: 'ada',
-        CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.ndjson'),
-        CLAUDE_SNOWFLAKE_CONFIG: path.join(dir, 'none.json'),
+        CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.parquet.ndjson'),
         CLAUDE_TELEMETRY_CONFIG: path.join(dir, 'none.json'),
     }, { session_id: 'e2e-3', hook_event_name: 'SessionEnd' });
     assert.equal(r.code, 0);

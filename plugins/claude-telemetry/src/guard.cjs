@@ -10,8 +10,8 @@
  *     telling Claude to help run the setup script and to refuse codebase work.
  *   - PreToolUse (matcher Edit|Write|NotebookEdit): hard-deny file edits as a backstop.
  *
- * "Configured" means the parquet sink's SAS URL resolves (CLAUDE_TELEMETRY_SAS_URL or
- * ~/.claude/telemetry.json), read fresh each run so no relaunch is needed.
+ * "Configured" means the upload SAS URL resolves (CLAUDE_TELEMETRY_SAS_URL or
+ * ~/.claude/telemetry.json) and has not expired, read fresh each run so no relaunch is needed.
  * Escape hatch: CLAUDE_TELEMETRY_GUARD_BYPASS=1 (or the legacy CLAUDE_SNOWFLAKE_GUARD_BYPASS=1).
  *
  * Node built-ins only. Always exits 0.
@@ -28,13 +28,15 @@ const PROMPT_GUIDANCE = [
     'Your only task is to configure telemetry. Run:',
     `  ${SETUP}`,
     'It reads the telemetry upload URL from Azure Key Vault (needs `az login`) and writes',
-    '~/.claude/telemetry.json. No relaunch is needed once that file exists.',
+    '~/.claude/telemetry.json. No relaunch is needed once that file exists. If a URL is already',
+    'configured it has expired; re-running the script picks up the rotated one.',
     'If it reports no vault access, tell the user to ask DevOps for read access to the telemetry secret.',
     'If the user asks for codebase work, decline and offer to run the setup instead.',
 ].join('\n');
 
 const DENY_REASON = [
     'Repo edits are blocked until Claude usage telemetry is configured (setup-only mode).',
+    'A configured upload URL that has expired counts as not configured.',
     '',
     'To configure it (you can still chat while you do this):',
     `  ${SETUP}`,
@@ -43,14 +45,15 @@ const DENY_REASON = [
 ].join('\n');
 
 /**
- * Whether edits may proceed: the guard is off, bypassed, or the parquet sink is configured.
+ * Whether edits may proceed: the guard is off, bypassed, or an unexpired upload URL is configured.
  * @param {NodeJS.ProcessEnv} env
  * @returns {boolean}
  */
 function isConfigured(env) {
     if (env.CLAUDE_TELEMETRY_REQUIRED !== '1') return true;
     if (env.CLAUDE_TELEMETRY_GUARD_BYPASS === '1' || env.CLAUDE_SNOWFLAKE_GUARD_BYPASS === '1') return true;
-    return resolveBlobConfig(env) != null;
+    const blob = resolveBlobConfig(env);
+    return blob != null && !blob.expired;
 }
 
 /**

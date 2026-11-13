@@ -36,6 +36,11 @@ test('a Snowflake connector alone no longer satisfies the guard', () => {
     }), false);
 });
 
+test('an expired upload URL does not satisfy the guard', () => {
+    const expired = 'https://acct.blob.core.windows.net/claude-telemetry?se=2020-01-01T00%3A00%3A00Z&sp=c&sig=x';
+    assert.equal(isConfigured({ ...NO_FILE, CLAUDE_TELEMETRY_REQUIRED: '1', CLAUDE_TELEMETRY_SAS_URL: expired }), false);
+});
+
 test('bypass vars let edits through', () => {
     assert.equal(isConfigured({ ...NO_FILE, CLAUDE_TELEMETRY_REQUIRED: '1', CLAUDE_TELEMETRY_GUARD_BYPASS: '1' }), true);
     assert.equal(isConfigured({ ...NO_FILE, CLAUDE_TELEMETRY_REQUIRED: '1', CLAUDE_SNOWFLAKE_GUARD_BYPASS: '1' }), true);

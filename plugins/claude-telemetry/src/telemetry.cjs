@@ -9,15 +9,10 @@
  * hooks. Claude Code passes the hook payload as JSON on stdin; this reshapes it
  * into a flat row of metadata destined for WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS.
  *
- * Two sinks, each with its own spool and retry so one failing never re-sends the other:
- *   - parquet: each flushed batch is encoded as parquet (dist/parquet-writer.cjs, loaded only
- *     at flush) and PUT to <sas_url>/claudecodeevents/<batch>-<n>.parquet with a create-only SAS;
- *     Snowpipe loads it. The blob name is fixed per batch, so a retried upload is a no-op (409).
- *     Config: CLAUDE_TELEMETRY_SAS_URL, else sas_url in ~/.claude/telemetry.json
- *     (override the file with CLAUDE_TELEMETRY_CONFIG).
- *   - snowflake: the legacy multi-row INSERT via the Snowflake SQL REST API, kept while the pipe
- *     is proven. Runs only when its connector (below) is configured; CLAUDE_TELEMETRY_SNOWFLAKE=0
- *     turns it off even then.
+ * Each flushed batch is encoded as parquet (dist/parquet-writer.cjs, loaded only at flush)
+ * and PUT to <sas_url>/claudecodeevents/<batch>-<n>.parquet with a create-only container
+ * SAS; Snowpipe loads it. The blob name is fixed per batch and the PUT is If-None-Match: *,
+ * so a retried upload is a no-op (409) rather than a duplicate.
  *
  * Every event also carries where it ran — REPOSITORY / WORKFLOW / BRANCH (CI env
  * vars in Actions, the local git checkout otherwise) — plus the client ENTRYPOINT
@@ -27,44 +22,21 @@
  * on SubagentStop, the same from the subagent's own transcript. Each API message
  * is counted once, however many transcript lines it is written as.
  *
- * Events are NOT written one statement per event — that keeps the warehouse
- * resumed continuously for near-zero data. Each event is appended to a
- * machine-local spool, and the whole spool is flushed as ONE multi-row INSERT on
- * SessionEnd (or when it passes a size cap), collapsing ~100 statements/session
- * into ~1. Interactive sessions flush via a detached child (no session latency);
- * CI / cloud / service-identity runs flush in-process (a short-lived job would
- * reap a detached child, and an inline key must never enter a child's env).
+ * Events are NOT uploaded one per event. Each is appended to a machine-local spool, and
+ * the whole spool is flushed as one parquet file on SessionEnd (or when it passes a size
+ * cap). Interactive sessions flush via a detached child (no session latency); CI / cloud
+ * runs flush in-process, since a short-lived job would reap a detached child.
  *
- * The snowflake sink's configuration comes from a hidden per-user JSON file written at setup —
- * ~/.snowflake/claude-telemetry.json (override with CLAUDE_SNOWFLAKE_CONFIG) —
- * with keys: account, user, private_key_file, and optionally private_key_passphrase,
- * role, warehouse, database, schema, table, host. The file is read on every run,
- * so no relaunch is needed after it is written. Environment variables below fill
- * any gaps and keep older env-only setups working:
- *   SNOWFLAKE_ACCOUNT              account identifier, e.g. fpthfcq-lx42606 (required)
- *   SNOWFLAKE_USER                 your Snowflake login (required)
- *   SNOWFLAKE_PRIVATE_KEY_FILE     absolute path to the PKCS#8 private key (required*)
- *   SNOWFLAKE_PRIVATE_KEY          the PKCS#8 private key inline as PEM (required*)
- *   SNOWFLAKE_PRIVATE_KEY_B64      the PKCS#8 private key inline, base64 of the PEM (required*)
- *     (* one key source is required: a file path, or an inline PEM / base64 value.
- *      Inline keys let a non-interactive service identity — CI/CD, cloud, a
- *      scheduled job — authenticate from a secret with no on-disk connector file.)
- *   SNOWFLAKE_PRIVATE_KEY_PASSPHRASE  passphrase, if the key is encrypted (optional)
- *   SNOWFLAKE_ROLE                 role to write as (optional; unset = the user's default role)
- *   SNOWFLAKE_WAREHOUSE            warehouse (default WEAVIX_AI_WH)
- *   SNOWFLAKE_AI_DATABASE          target database (default WEAVIX_AI)
- *   SNOWFLAKE_AI_SCHEMA            target schema (default TELEMETRY)
- *   SNOWFLAKE_AI_TABLE             target table (default CLAUDE_CODE_EVENTS)
- *   SNOWFLAKE_HOST                 override the API host (default <account>.snowflakecomputing.com)
+ * Configuration:
+ *   CLAUDE_TELEMETRY_SAS_URL       upload URL with SAS (else sas_url in ~/.claude/telemetry.json)
+ *   CLAUDE_TELEMETRY_CONFIG        alternate path for that config file
  *   CLAUDE_AI_TELEMETRY_ENV        environment tag for this session (default $TARGET or 'local')
  *   CLAUDE_AI_TELEMETRY_ACTOR      who to attribute the run to in CLIENT_USER
  *                                  (default $GITHUB_ACTOR or $USER) — e.g. the service identity
- *   CLAUDE_SF_SYNC                 '1' forces an in-process flush, '0' forces a detached flush — but an
- *                                  inline key always flushes in-process regardless (so the key
- *                                  never enters a detached child's env); unset auto-detects CI,
- *                                  flushing in-process so a short-lived process does not exit first
+ *   CLAUDE_SF_SYNC                 '1' forces an in-process flush, '0' a detached one; unset
+ *                                  auto-detects CI and flushes in-process there
  *
- * Node built-ins only on the hot path. It is a silent no-op when neither sink is
+ * Node built-ins only on the hot path. It is a silent no-op when no upload URL is
  * configured, never exits non-zero, and never emits prompt text or message bodies —
  * only metadata. Failed flushes are noted (status only, never the SAS) in a local
  * errors log next to the spool.
@@ -78,11 +50,9 @@ const path = require('path');
 const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 
-// Fixed, ordered column list. Matches WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS.
-// RECORDED_AT is populated server-side (DEFAULT CURRENT_TIMESTAMP), so it is
-// deliberately absent here. The table's schema is owned by the data repo's
-// migrations/ai singleton and is always at or ahead of this list, so a widened
-// COLUMNS lands cleanly (no per-column schema-lag fallback needed here).
+// Fixed, ordered column list. Matches WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS, whose schema the
+// data repo's migrations/ai owns and keeps at or ahead of this list. RECORDED_AT is stamped
+// by the pipe at load, so it is deliberately absent here.
 const COLUMNS = [
     'SESSION_ID', 'HOOK_EVENT', 'CATEGORY', 'ACTION', 'SOURCE',
     'AGENT_TYPE', 'AGENT_ID', 'TOOL_NAME', 'SKILL', 'PERMISSION_MODE',
@@ -92,13 +62,6 @@ const COLUMNS = [
     'CACHE_READ_INPUT_TOKENS', 'ENTRYPOINT', 'SESSION_ATTENDED',
     'MODEL',
 ];
-
-// Bind types for the columns that are not VARCHAR; the rest bind as TEXT.
-const COLUMN_TYPES = {
-    INPUT_TOKENS: 'FIXED', OUTPUT_TOKENS: 'FIXED',
-    CACHE_CREATION_INPUT_TOKENS: 'FIXED', CACHE_READ_INPUT_TOKENS: 'FIXED',
-    SESSION_ATTENDED: 'BOOLEAN',
-};
 
 // The base column count (through ENVIRONMENT). Newer columns are only ever appended, so a
 // spooled row is valid if it has between MIN_ROW_WIDTH and COLUMNS.length values: a row
@@ -485,180 +448,24 @@ function toRow(event) {
     return COLUMNS.map(c => (byColumn[c] === undefined ? null : byColumn[c]));
 }
 
-const IDENT = /^[A-Za-z0-9_]+$/;
 
-/**
- * Build a parameterised multi-row INSERT and its bindings for the SQL API.
- * Values are bound (never interpolated); identifiers are validated against a
- * strict allow-list so a stray env var can never inject SQL. One statement
- * carries every row, so a whole session's telemetry lands in a single
- * warehouse statement instead of one per event. Each value binds by its column's
- * type (COLUMN_TYPES) so the numeric token columns and the boolean attended flag
- * land as numbers/booleans, not strings; every other column binds as TEXT.
- * @param {Array<Array<string|number|boolean|null>>} rows rows already in COLUMNS order (see toRow)
- * @returns {{statement: string, bindings: Record<string, {type: string, value: string|null}>}}
- */
-function buildBatchInsert(rows, target) {
-    for (const id of [target.database, target.schema, target.table]) {
-        if (!IDENT.test(id)) throw new Error(`invalid identifier: ${id}`);
-    }
-    const fqtn = `${target.database}.${target.schema}.${target.table}`;
-    const tuple = `(${COLUMNS.map(() => '?').join(', ')})`;
-    const statement = `INSERT INTO ${fqtn} (${COLUMNS.join(', ')}) VALUES ${rows.map(() => tuple).join(', ')}`;
 
-    const bindings = {};
-    let i = 1;
-    for (const row of rows) {
-        row.forEach((v, j) => {
-            const type = COLUMN_TYPES[COLUMNS[j]] || 'TEXT';
-            const value = v == null ? null
-                : type === 'BOOLEAN' ? (v ? 'true' : 'false')
-                : String(v);
-            bindings[String(i++)] = { type, value };
-        });
-    }
-    return { statement, bindings };
-}
 
-/**
- * Build the INSERT for a single event — a thin wrapper over buildBatchInsert for
- * the degenerate one-row batch. Both write paths flush via buildBatchInsert; this
- * remains as a tested helper that pins the single-row statement shape.
- * @returns {{statement: string, bindings: Record<string, {type: string, value: string|null}>}}
- */
-function buildInsert(event, target) {
-    return buildBatchInsert([toRow(event)], target);
-}
 
-/** base64url, no padding. */
-function b64url(buf) {
-    return Buffer.from(buf).toString('base64')
-        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
 
-/**
- * Normalise an account identifier for the key-pair JWT: uppercase, and drop any
- * region/cloud segment after the first dot (mirrors the Snowflake connectors).
- * e.g. "fpthfcq-lx42606" -> "FPTHFCQ-LX42606"; "abc.us-east-1" -> "ABC".
- */
-function normalizeAccount(account) {
-    const upper = account.toUpperCase();
-    const dot = upper.indexOf('.');
-    return dot === -1 ? upper : upper.slice(0, dot);
-}
 
-/**
- * Build a Snowflake key-pair (KEYPAIR_JWT) bearer token from the private key.
- * @returns {string} signed JWT
- */
-function buildJwt(privateKeyPem, passphrase, account, user, nowSec) {
-    const privateKey = crypto.createPrivateKey(
-        passphrase ? { key: privateKeyPem, passphrase } : privateKeyPem,
-    );
-    const publicDer = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'der' });
-    const fp = 'SHA256:' + crypto.createHash('sha256').update(publicDer).digest('base64');
 
-    const acct = normalizeAccount(account);
-    const qualifiedUser = `${acct}.${user.toUpperCase()}`;
-    const header = { alg: 'RS256', typ: 'JWT' };
-    const claims = {
-        iss: `${qualifiedUser}.${fp}`,
-        sub: qualifiedUser,
-        iat: nowSec,
-        exp: nowSec + 3600,
-    };
-    const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(claims))}`;
-    const signature = crypto.sign('RSA-SHA256', Buffer.from(signingInput), privateKey);
-    return `${signingInput}.${b64url(signature)}`;
-}
 
-/**
- * Absolute path to the connector config JSON. Defaults to a hidden per-user
- * file; override with CLAUDE_SNOWFLAKE_CONFIG (used by tests and CI).
- */
-function configFilePath(env) {
-    return env.CLAUDE_SNOWFLAKE_CONFIG || path.join(os.homedir(), '.snowflake', 'claude-telemetry.json');
-}
 
-/** Read and parse the connector config JSON, or {} if absent/unreadable. */
-function readConfigFile(env) {
-    try {
-        return JSON.parse(fs.readFileSync(configFilePath(env), 'utf8'));
-    } catch {
-        return {};
-    }
-}
 
-/**
- * Normalise an inline PEM. CI/CD secret stores often flatten a multi-line key to
- * one line with literal "\n" sequences; restore them if there are no real
- * newlines. A key delivered with genuine newlines (or via base64) is untouched.
- */
-function normalizePem(pem) {
-    return pem.includes('\n') ? pem : pem.replace(/\\n/g, '\n');
-}
 
-/**
- * An inline private key from config/env, or undefined. Prefers base64 (safe for
- * multi-line secrets); falls back to a raw PEM value. This is what lets a
- * non-interactive service identity authenticate without an on-disk key file.
- * @returns {string|undefined} PEM text
- */
-function resolveInlineKey(f, env) {
-    const b64 = f.private_key_b64 || env.SNOWFLAKE_PRIVATE_KEY_B64;
-    // base64 decode never throws; a malformed value yields a bad PEM that fails
-    // harmlessly later in buildJwt rather than here.
-    if (b64) return Buffer.from(b64, 'base64').toString('utf8');
-    const raw = f.private_key || env.SNOWFLAKE_PRIVATE_KEY;
-    return raw ? normalizePem(raw) : undefined;
-}
 
-/**
- * Resolve connector config, or null if it is not set up. The hidden JSON file
- * (configFilePath) is the source of truth; environment variables fill any gaps
- * and keep older env-only setups working. Requires an account, a user, and a
- * private key from either a file (interactive per-user connector) or an inline
- * value (non-interactive service identity — CI/CD, cloud, scheduled jobs).
- * @param {NodeJS.ProcessEnv} env
- */
-function resolveConfig(env) {
-    const f = readConfigFile(env);
-    const account = f.account || env.SNOWFLAKE_ACCOUNT;
-    const user = f.user || env.SNOWFLAKE_USER;
-    const keyFile = f.private_key_file || env.SNOWFLAKE_PRIVATE_KEY_FILE;
-    const keyData = resolveInlineKey(f, env);
-    if (!account || !user || (!keyFile && !keyData)) return null;
-    return {
-        account,
-        user,
-        // An inline key wins over a file path when both are present.
-        keyFile: keyData ? undefined : keyFile,
-        keyData,
-        passphrase: f.private_key_passphrase || env.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE || undefined,
-        // Role is optional: unset means write as the user's default role, which
-        // inherits AI_USAGE_ROLE (granted to the human functional roles) — so
-        // telemetry works for every user.
-        role: f.role || env.SNOWFLAKE_ROLE || undefined,
-        warehouse: f.warehouse || env.SNOWFLAKE_WAREHOUSE || 'WEAVIX_AI_WH',
-        host: f.host || env.SNOWFLAKE_HOST || `${account.toLowerCase()}.snowflakecomputing.com`,
-        target: {
-            database: f.database || env.SNOWFLAKE_AI_DATABASE || 'WEAVIX_AI',
-            schema: f.schema || env.SNOWFLAKE_AI_SCHEMA || 'TELEMETRY',
-            table: f.table || env.SNOWFLAKE_AI_TABLE || 'CLAUDE_CODE_EVENTS',
-        },
-    };
-}
-
-/** Read the private key from the inline value if present, else from the file. */
-function readPrivateKey(cfg) {
-    return cfg.keyData != null ? cfg.keyData : fs.readFileSync(cfg.keyFile, 'utf8');
-}
 
 /**
  * Whether to write synchronously rather than via a detached child. A detached
  * writer is right for a long-lived interactive session (no added latency), but a
  * short-lived non-interactive process — a CI/CD step, a scheduled job — exits the
- * instant the hook returns and would reap the child before the POST completes. So
+ * instant the hook returns and would reap the child before the upload completes. So
  * write inline there. CLAUDE_SF_SYNC forces it either way ('1' on, '0' off);
  * unset, common CI markers auto-enable it.
  * @param {NodeJS.ProcessEnv} env
@@ -669,32 +476,17 @@ function isNonInteractive(env) {
     return Boolean(env.CI || env.GITHUB_ACTIONS || env.CONTINUOUS_INTEGRATION || env.BUILD_ID || env.RUNNER_OS);
 }
 
-/**
- * Whether to write in-process rather than via a detached child. Two reasons force
- * it: a non-interactive run is short-lived and would reap a detached child before
- * the POST lands; and an inline key must never be serialized into a detached
- * child's environment — the in-process path keeps the key inside this process.
- */
-function shouldWriteSync(cfg, env) {
-    return (cfg != null && cfg.keyData != null) || isNonInteractive(env);
-}
 
 // --- Spool / batching (all sessions) ---------------------------------------
 //
-// A session fires this hook many times (once per prompt, turn, subagent, and
-// skill use). Writing each as its own INSERT keeps the warehouse resumed
-// continuously for near-zero data. Instead, each event is appended to a
-// machine-local spool and the whole spool is flushed as ONE multi-row INSERT on
-// SessionEnd (or when it passes a size cap), collapsing ~100 statements/session
-// into ~1. Both write paths spool; they differ only in how the flush is sent —
-// interactive via a detached child, CI / cloud in-process (see main()).
+// A session fires this hook many times (once per prompt, turn, subagent, and skill use).
+// Each event is appended to a machine-local spool and the whole spool is flushed as one
+// parquet upload on SessionEnd (or when it passes a size cap). Interactive sessions flush
+// via a detached child, CI / cloud in-process (see main()).
 
 // Flush the spool once it passes this size, so a long or busy session bounds both
-// warehouse latency and how much telemetry a hard crash could lose.
+// ingest latency and how much telemetry a hard crash could lose.
 const SPOOL_MAX_BYTES = 128 * 1024;
-// Cap rows per INSERT so a large backlog is chunked rather than sent as one
-// oversized statement.
-const MAX_ROWS_PER_INSERT = 500;
 // A batch file younger than this is assumed to be in flight in another process;
 // only reclaim it as orphaned once it is older, so a live flush is not stolen.
 const ORPHAN_RETRY_AFTER_MS = 60 * 1000;
@@ -709,21 +501,17 @@ const ORPHAN_DROP_AFTER_MS = 24 * 60 * 60 * 1000;
  * sessions on the machine — that only batches more events together; every row
  * still carries its own SESSION_ID.
  */
-function spoolPath(env, sink = 'snowflake') {
-    const base = env.CLAUDE_SF_SPOOL || defaultSpoolPath(env);
-    // The snowflake spool keeps its original name so a spool written before the upgrade still flushes.
-    return sink === 'snowflake' ? base : base.replace(/\.ndjson$/, '') + `.${sink}.ndjson`;
-}
-
-/** Machine-local spool path for the snowflake sink, per OS user, under the system temp dir. */
-function defaultSpoolPath(env) {
+function spoolPath(env) {
+    if (env.CLAUDE_SF_SPOOL) return env.CLAUDE_SF_SPOOL;
     let user = env.USER || env.USERNAME;
     if (!user) { try { user = os.userInfo().username; } catch { user = 'default'; } }
     const safe = String(user).replace(/[^A-Za-z0-9_.-]/g, '_');
-    // Own subdirectory (created 0700) so the spool and its batch files are not
-    // world-writable siblings in the shared temp root.
-    return path.join(os.tmpdir(), 'claude-telemetry', `spool.${safe}.ndjson`);
+    // Own subdirectory (created 0700) so the spool and its batch files are not world-writable
+    // siblings in the shared temp root. Named apart from the legacy Snowflake hook's
+    // spool.<user>.ndjson, so a machine still running that hook never mixes the two.
+    return path.join(os.tmpdir(), 'claude-telemetry', `spool.${safe}.parquet.ndjson`);
 }
+
 
 /**
  * Append one row (COLUMNS order) as an NDJSON line. Creates the dir if needed and
@@ -816,160 +604,16 @@ function claimBatches(sp, now, uuid) {
     return files;
 }
 
-/**
- * Read the claimed batch files, send their rows as chunked multi-row INSERTs,
- * and on full success delete the files. The first chunk failure aborts the rest
- * (retention is per-file, so a later flush re-sends the whole batch — sending more
- * now would only duplicate what lands); the files are left in place to be
- * re-adopted (at-least-once), with their mtime bumped to now so they are not
- * re-sent until another ORPHAN_RETRY_AFTER_MS has passed — a backoff, so an
- * intermittent-Snowflake window does not re-resume the warehouse on every flush. A crash between a successful POST and the delete can
- * re-send a batch — a rare duplicate that the adoption grace makes unlikely; rows
- * are otherwise not de-dupable, so consumers should treat counts as approximate.
- * `timeoutMs` bounds each POST; `totalBudgetMs` bounds the whole (possibly
- * multi-chunk) flush in wall-clock time — the in-process path passes a budget
- * under the hook timeout so it stops gracefully rather than being killed mid-POST,
- * while the detached child passes Infinity (it outlives the hook). Never throws;
- * always calls done. `post` is injectable for tests.
- */
-function flushBatches(cfg, files, timeoutMs, done, post = postStatement, totalBudgetMs = Infinity) {
-    let rows = [];
-    for (const f of files) {
-        try { rows = rows.concat(parseSpool(fs.readFileSync(f, 'utf8'))); } catch { /* skip unreadable */ }
-    }
-    if (rows.length === 0) {
-        for (const f of files) { try { fs.unlinkSync(f); } catch { /* already gone */ } }
-        return done(true);
-    }
 
-    let settled = false;
-    let allOk = true;
-    let hardTimer = null;
-    // Finalize exactly once: delete the files if every chunk landed, otherwise
-    // retain them (bumping mtime so the retry grace applies) and report failure.
-    const finalize = () => {
-        if (settled) return;
-        settled = true;
-        if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
-        if (allOk) {
-            for (const f of files) { try { fs.unlinkSync(f); } catch { /* already gone */ } }
-        } else {
-            const t = Date.now() / 1000;
-            for (const f of files) { try { fs.utimesSync(f, t, t); } catch { /* already gone */ } }
-        }
-        done(allOk);
-    };
-
-    // Hard wall-clock ceiling for the WHOLE (possibly multi-chunk) flush. A per-POST
-    // timeout can't bound the total — a socket to a slow/unreachable host may abort
-    // early (letting the next chunk start) or late, so total time drifts. This timer
-    // guarantees the in-process flush returns within the hook timeout regardless. The
-    // detached child passes Infinity (it outlives the hook) and installs no ceiling.
-    if (totalBudgetMs !== Infinity) {
-        hardTimer = setTimeout(() => { allOk = false; finalize(); }, totalBudgetMs);
-        if (hardTimer.unref) hardTimer.unref();
-    }
-
-    const chunks = chunk(rows, MAX_ROWS_PER_INSERT);
-    let idx = 0;
-    const next = () => {
-        if (settled) return; // the hard ceiling already finalized this flush
-        if (idx >= chunks.length) return finalize();
-        let insert;
-        try {
-            insert = buildBatchInsert(chunks[idx], cfg.target);
-        } catch {
-            allOk = false; idx += 1; return next();
-        }
-        post(cfg, insert.statement, insert.bindings, ok => {
-            if (settled) return; // a POST that lands after the ceiling fired changes nothing
-            if (!ok) {
-                // Stop at the first failure. Retention is per-file, so a later flush
-                // re-sends the whole batch anyway — sending more chunks now would just
-                // duplicate the ones that land and keep the warehouse resumed longer.
-                allOk = false;
-                return finalize();
-            }
-            idx += 1; next();
-        }, timeoutMs);
-    };
-    next();
-}
-
-// Request timeouts. A detached background writer can wait out a cold-warehouse
-// resume (WEAVIX_AI_WH auto-suspends at 60s). A synchronous (CI/cloud) flush runs
-// in the hook's own process, so each POST is capped short AND the whole flush is
-// bounded by a total wall-clock budget (SYNC_FLUSH_BUDGET_MS) — so even a
-// multi-chunk flush against a slow Snowflake returns before the 10s hook timeout
-// rather than being killed mid-write.
+// Request timeouts. A detached background flush can wait out a slow upload. An in-process
+// (CI/cloud) flush runs in the hook's own process, so each PUT is capped short AND the whole
+// flush is bounded by a total wall-clock budget, returning before the 10s hook timeout.
 const DETACHED_WRITE_TIMEOUT_MS = 30000;
 const SYNC_WRITE_TIMEOUT_MS = 8000;
-// Hard wall-clock ceiling for one in-process flush, across all its chunks —
-// comfortably under the 10s hook timeout with headroom for process start, JWT
-// signing, and TLS setup, so the hook is never killed mid-flush.
+// Hard wall-clock ceiling for one in-process flush, across all its parts, with headroom under
+// the 10s hook timeout for process start, loading the encoder, and TLS setup.
 const SYNC_FLUSH_BUDGET_MS = 7000;
 
-/**
- * POST one INSERT to the Snowflake SQL API. Any failure is swallowed so
- * telemetry never surfaces to the user or blocks the session. Calls
- * done(ok) — ok is true only on a 2xx — so the batch flusher knows whether it
- * may delete the spooled rows or must leave them to retry.
- */
-function postStatement(cfg, statement, bindings, done, timeoutMs = DETACHED_WRITE_TIMEOUT_MS) {
-    let jwt;
-    try {
-        const pem = readPrivateKey(cfg);
-        jwt = buildJwt(pem, cfg.passphrase, cfg.account, cfg.user, Math.floor(Date.now() / 1000));
-    } catch {
-        return done(false);
-    }
-
-    const body = JSON.stringify({
-        statement,
-        timeout: 60,
-        // Omit role entirely when unset → Snowflake uses the user's default role.
-        ...(cfg.role ? { role: cfg.role } : {}),
-        warehouse: cfg.warehouse,
-        database: cfg.target.database,
-        schema: cfg.target.schema,
-        bindings,
-    });
-
-    let url;
-    try {
-        url = new URL(`https://${cfg.host}/api/v2/statements?requestId=${crypto.randomUUID()}`);
-    } catch {
-        return done(false);
-    }
-
-    const transport = url.protocol === 'http:' ? http : https;
-    const req = transport.request(
-        url,
-        {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                // The Snowflake SQL API rejects requests without a User-Agent (HTTP 400).
-                'User-Agent': 'weavix-claude-telemetry/1.0',
-                'Authorization': `Bearer ${jwt}`,
-                'X-Snowflake-Authorization-Token-Type': 'KEYPAIR_JWT',
-                'Content-Length': Buffer.byteLength(body),
-            },
-        },
-        res => {
-            const ok = res.statusCode >= 200 && res.statusCode < 300;
-            res.resume();
-            res.on('end', () => done(ok));
-        },
-    );
-    // Bounded by the caller: the detached writer allows a full cold-start resume;
-    // a synchronous CI write is capped short so it never outlives the hook timeout.
-    req.setTimeout(timeoutMs, () => req.destroy());
-    req.on('error', () => done(false));
-    req.write(body);
-    req.end();
-}
 
 // --- Parquet sink ------------------------------------------------------------
 
@@ -995,11 +639,12 @@ function blobConfigFilePath(env) {
 /**
  * Resolve the parquet sink's SAS URL, or null when it is absent or malformed.
  * CLAUDE_TELEMETRY_SAS_URL wins over sas_url in the config file. Must be signed, and https
- * unless it targets loopback (a local test server).
+ * unless it targets loopback (a local test server). `expired` is true once its `se` has passed.
  * @param {NodeJS.ProcessEnv} env
- * @returns {{sasUrl: string}|null}
+ * @param {number} [now] epoch millis, injectable for tests
+ * @returns {{sasUrl: string, expiresAt: (number|null), expired: boolean}|null}
  */
-function resolveBlobConfig(env) {
+function resolveBlobConfig(env, now = Date.now()) {
     let sasUrl = env.CLAUDE_TELEMETRY_SAS_URL;
     if (!sasUrl) {
         try { sasUrl = JSON.parse(fs.readFileSync(blobConfigFilePath(env), 'utf8')).sas_url; } catch { sasUrl = undefined; }
@@ -1009,16 +654,13 @@ function resolveBlobConfig(env) {
         const u = new URL(String(sasUrl).trim());
         const loopback = u.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(u.hostname);
         if ((u.protocol !== 'https:' && !loopback) || !u.searchParams.get('sig')) return null;
-        return { sasUrl: u.toString() };
+        const se = Date.parse(u.searchParams.get('se') || '');
+        return { sasUrl: u.toString(), expiresAt: Number.isNaN(se) ? null : se, expired: !Number.isNaN(se) && se <= now };
     } catch {
         return null;
     }
 }
 
-/** Whether the legacy Snowflake sink should run for this config (off with CLAUDE_TELEMETRY_SNOWFLAKE=0). */
-function snowflakeEnabled(cfg, env) {
-    return cfg != null && env.CLAUDE_TELEMETRY_SNOWFLAKE !== '0';
-}
 
 /**
  * Stable id of a claimed batch file: its `<epochMs>.<uuid>` claim suffix, minus any adoption
@@ -1175,57 +817,43 @@ function flushParquetBatches(blob, files, timeoutMs, done, opts = {}) {
 }
 
 /**
- * Hand the batch flush to a detached background process and return. The hook
- * (parent) exits immediately, so telemetry adds no latency to the session, and a
- * slow cold-warehouse resume can't be cut off by the hook timeout — the child
- * owns it. Only ever reached on the interactive (file-keyed) path, so no inline
- * key is ever serialized into the child's environment.
+ * Hand the flush to a detached background process and return, so the session sees no latency.
+ * Only the batch file paths are passed; the child re-resolves the SAS from the same env / file.
  */
-function emitDetached(cfg, files, parquetFiles = []) {
-    // The SAS is not serialized: the child re-resolves it from the same env / config file.
-    const blob = Buffer.from(JSON.stringify({ cfg, files, parquetFiles })).toString('base64');
+function emitDetached(files) {
+    const job = Buffer.from(JSON.stringify({ parquetFiles: files })).toString('base64');
     const child = spawn(process.execPath, [__filename], {
         detached: true,
         stdio: 'ignore',
-        env: { ...process.env, CLAUDE_SF_EMIT: blob },
+        env: { ...process.env, CLAUDE_SF_EMIT: job },
     });
     child.unref();
 }
 
 /**
- * Flush both sinks' claimed batches in parallel and call done once both settle. A sink with no
- * config or no files is skipped. Failures are recorded in the local errors log.
- * @param {object|null} cfg snowflake config, or null when that sink is off
- * @param {string[]} files claimed snowflake batch files
- * @param {{sasUrl: string}|null} blob parquet sink config, or null when absent
- * @param {string[]} parquetFiles claimed parquet batch files
+ * Upload claimed batches and call done once they settle. Missing or expired config keeps the
+ * batches for a later flush and records why in the local errors log.
+ * @param {{sasUrl: string, expired: boolean}|null} blob upload config
+ * @param {string[]} files claimed batch files
  * @param {{timeoutMs: number, budgetMs: number}} limits per-request timeout and whole-flush budget
  * @param {() => void} done
  */
-function flushAll(cfg, files, blob, parquetFiles, limits, done) {
+function flushAll(blob, files, limits, done) {
     const env = process.env;
-    let pending = 0;
-    const settle = () => { pending -= 1; if (pending === 0) done(); };
-    if (cfg && files.length) {
-        pending += 1;
-        flushBatches(cfg, files, limits.timeoutMs, ok => {
-            if (!ok) logFailure(env, 'snowflake', 'insert-failed');
-            settle();
-        }, postStatement, limits.budgetMs);
+    if (!files.length) return done();
+    if (!blob || blob.expired) {
+        logFailure(env, 'parquet', blob ? 'sas-expired' : 'sas-missing');
+        return done();
     }
-    if (blob && parquetFiles.length) {
-        pending += 1;
-        flushParquetBatches(blob, parquetFiles, limits.timeoutMs, settle, {
-            totalBudgetMs: limits.budgetMs,
-            onError: reason => logFailure(env, 'parquet', reason),
-        });
-    }
-    if (pending === 0) done();
+    flushParquetBatches(blob, files, limits.timeoutMs, () => done(), {
+        totalBudgetMs: limits.budgetMs,
+        onError: reason => logFailure(env, 'parquet', reason),
+    });
 }
 
 function main() {
-    // Child mode: the detached flusher spawned below. Send the claimed batches
-    // and exit; it owns deleting them on success or leaving them to retry.
+    // Child mode: the detached flusher spawned below. Upload the claimed batches and exit; it
+    // owns deleting them on success or leaving them to retry.
     if (process.env.CLAUDE_SF_EMIT) {
         let job;
         try {
@@ -1233,17 +861,15 @@ function main() {
         } catch {
             process.exit(0);
         }
-        return flushAll(job.cfg, job.files || [], resolveBlobConfig(process.env), job.parquetFiles || [], {
+        return flushAll(resolveBlobConfig(process.env), job.parquetFiles || [], {
             timeoutMs: DETACHED_WRITE_TIMEOUT_MS, budgetMs: Infinity,
         }, () => process.exit(0));
     }
 
     // Hook mode: build the event and record it, returning fast.
-    const sfCfg = resolveConfig(process.env);
-    const cfg = snowflakeEnabled(sfCfg, process.env) ? sfCfg : null;
     const blob = resolveBlobConfig(process.env);
-    // No sink configured — nothing to do; succeed quietly.
-    if (!cfg && !blob) process.exit(0);
+    // No upload URL configured — nothing to do; succeed quietly.
+    if (!blob) process.exit(0);
 
     let input = '';
     process.stdin.setEncoding('utf8');
@@ -1272,14 +898,10 @@ function main() {
         });
 
         try {
-            // Both paths batch: append the event to the machine-local spool, and
-            // only when it is time flush the whole spool as one multi-row INSERT.
-            // Most events just append and return in microseconds.
-            const row = toRow(event);
-            const sp = spoolPath(process.env, 'snowflake');
-            const pp = spoolPath(process.env, 'parquet');
-            if (cfg) appendSpool(sp, row);
-            if (blob) appendSpool(pp, row);
+            // Append the event to the machine-local spool; only when it is time, flush the whole
+            // spool as one parquet upload. Most events just append and return in microseconds.
+            const sp = spoolPath(process.env);
+            appendSpool(sp, toRow(event));
 
             // The turn's tokens are now durably in the spool (its own retry owns delivery), so
             // advance the offset once here -- committing only after a deferred flush would let
@@ -1289,32 +911,23 @@ function main() {
                 commitTokenOffset(event._tokenCommit.sessionId, event._tokenCommit.offset, event._tokenCommit.carry);
             }
 
-            const sizeOf = p => { try { return fs.statSync(p).size; } catch { return 0; } };
-            const flushSf = cfg && shouldFlush(sizeOf(sp), event.hookEvent);
-            const flushPq = blob && shouldFlush(sizeOf(pp), event.hookEvent);
-            if (!flushSf && !flushPq) process.exit(0);
+            let size = 0;
+            try { size = fs.statSync(sp).size; } catch { /* raced away by a peer flush */ }
+            if (!shouldFlush(size, event.hookEvent)) process.exit(0);
 
-            const now = Date.now();
-            const files = flushSf ? claimBatches(sp, now, crypto.randomUUID()) : [];
-            const parquetFiles = flushPq ? claimBatches(pp, now, crypto.randomUUID()) : [];
-            if (!files.length && !parquetFiles.length) process.exit(0);
+            const files = claimBatches(sp, Date.now(), crypto.randomUUID());
+            if (!files.length) process.exit(0);
 
-            if (shouldWriteSync(cfg, process.env)) {
-                // CI / cloud / inline-key: flush in-process. A short-lived job would
-                // reap a detached child before its POST landed, and an inline key
-                // must never be serialized into a child's env — so the flush runs
-                // here, bounded by SYNC_FLUSH_BUDGET_MS so it returns within the hook
-                // timeout even across multiple chunks. A hard kill before/mid-flush
-                // drops that (bounded) batch; acceptable for best-effort telemetry,
-                // and still far fewer statements per job.
-                return flushAll(cfg, files, blob, parquetFiles, {
+            if (isNonInteractive(process.env)) {
+                // CI / cloud: flush in-process, since a short-lived job would reap a detached
+                // child before its upload landed. Bounded by SYNC_FLUSH_BUDGET_MS so it returns
+                // within the hook timeout. A hard kill mid-flush drops that bounded batch.
+                return flushAll(blob, files, {
                     timeoutMs: SYNC_WRITE_TIMEOUT_MS, budgetMs: SYNC_FLUSH_BUDGET_MS,
                 }, () => process.exit(0));
             }
 
-            // Interactive: hand the flush to a detached child so the session sees no
-            // latency and a cold-warehouse resume can't be cut off by the hook timeout.
-            emitDetached(cfg, files, parquetFiles);
+            emitDetached(files);
         } catch {
             /* never let telemetry surface an error to the session */
         }
@@ -1325,12 +938,11 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-    buildEvent, toRow, buildInsert, buildBatchInsert, normalizeAccount, resolveConfig, resolveInlineKey,
-    normalizePem, readPrivateKey, isNonInteractive, shouldWriteSync, configFilePath, COLUMNS, COLUMN_TYPES,
-    spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches, flushBatches,
-    SPOOL_MAX_BYTES, MAX_ROWS_PER_INSERT, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
+    buildEvent, toRow, isNonInteractive, COLUMNS,
+    spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches,
+    SPOOL_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
     repoFromRemote, resolveOrigin, turnTokens, initTokenOffset, commitTokenOffset,
     originCacheFile, cleanupSessionState, usageInt, MIN_ROW_WIDTH, STATE_RETENTION_MS,
-    resolveBlobConfig, blobConfigFilePath, snowflakeEnabled, batchId, blobUrlFor, uploadBlob,
+    resolveBlobConfig, blobConfigFilePath, batchId, blobUrlFor, uploadBlob,
     flushParquetBatches, flushAll, logFailure, PARQUET_COLUMN_TYPES, PARQUET_ENTITY, MAX_ROWS_PER_PARQUET,
 };

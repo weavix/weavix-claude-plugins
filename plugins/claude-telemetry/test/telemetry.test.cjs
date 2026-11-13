@@ -1,10 +1,9 @@
 'use strict';
 
 /**
- * Unit test for snowflake-telemetry.cjs. Exercises the pure transforms
- * (buildEvent, toRow, buildInsert, normalizeAccount) and config resolution
- * (resolveConfig) — no network, no keys.
- * Run: node .claude/hooks/snowflake-telemetry.test.cjs
+ * Unit tests for telemetry.cjs event building, token counting, and the spool / batch-claim
+ * machinery — no network, no keys. Parquet encoding and upload are in parquet.test.cjs.
+ * Run: node plugins/claude-telemetry/test/telemetry.test.cjs
  */
 
 const assert = require('node:assert');
@@ -12,16 +11,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-    buildEvent, toRow, buildInsert, buildBatchInsert, normalizeAccount, resolveConfig, COLUMNS,
-    resolveInlineKey, normalizePem, readPrivateKey, isNonInteractive, shouldWriteSync,
-    spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches, flushBatches,
-    SPOOL_MAX_BYTES, MAX_ROWS_PER_INSERT, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
+    buildEvent, toRow, COLUMNS, isNonInteractive,
+    spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches,
+    SPOOL_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
     repoFromRemote, resolveOrigin, turnTokens, initTokenOffset, commitTokenOffset,
     originCacheFile, cleanupSessionState, usageInt, MIN_ROW_WIDTH,
 } = require('../src/telemetry.cjs');
 
-const NO_FILE = { CLAUDE_SNOWFLAKE_CONFIG: path.join(os.tmpdir(), 'does-not-exist.json') };
-const FAKE_PEM = '-----BEGIN PRIVATE KEY-----\nMIIABC\n-----END PRIVATE KEY-----\n';
 
 const CTX = { host: 'dev-host', user: 'ada', environment: 'local' };
 const build = payload => buildEvent(payload, CTX);
@@ -107,114 +103,7 @@ test('toRow places values in COLUMNS order and nulls the rest', () => {
     assert.equal(row[COLUMNS.indexOf('AGENT_ID')], null); // absent -> null
 });
 
-test('buildInsert produces one placeholder + binding per column', () => {
-    const { statement, bindings } = buildInsert(
-        build({ hook_event_name: 'SessionStart', session_id: 's1' }),
-        { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' },
-    );
-    assert.ok(statement.startsWith('INSERT INTO WEAVIX_AI.TELEMETRY.CLAUDE_CODE_EVENTS ('));
-    assert.equal((statement.match(/\?/g) || []).length, COLUMNS.length);
-    assert.equal(Object.keys(bindings).length, COLUMNS.length);
-    assert.deepEqual(bindings['1'], { type: 'TEXT', value: 's1' }); // SESSION_ID
-    assert.equal(bindings[String(COLUMNS.indexOf('AGENT_ID') + 1)].value, null);
-});
-
-test('buildInsert rejects a non-identifier target (no SQL injection surface)', () => {
-    assert.throws(() => buildInsert(build({ hook_event_name: 'SessionStart' }), {
-        database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'EVENTS; DROP TABLE X',
-    }));
-});
-
-test('normalizeAccount uppercases and strips region after the first dot', () => {
-    assert.equal(normalizeAccount('fpthfcq-lx42606'), 'FPTHFCQ-LX42606');
-    assert.equal(normalizeAccount('abc.us-east-1.aws'), 'ABC');
-});
-
-test('resolveConfig reads the JSON config file (CLAUDE_SNOWFLAKE_CONFIG)', () => {
-    const p = path.join(os.tmpdir(), `sfcfg-${process.pid}.json`);
-    fs.writeFileSync(p, JSON.stringify({
-        account: 'fpthfcq-lx42606', user: 'ada', private_key_file: '/keys/ada.p8', database: 'WEAVIX_AI',
-    }));
-    try {
-        const c = resolveConfig({ CLAUDE_SNOWFLAKE_CONFIG: p });
-        assert.equal(c.account, 'fpthfcq-lx42606');
-        assert.equal(c.user, 'ada');
-        assert.equal(c.keyFile, '/keys/ada.p8');
-        assert.equal(c.role, undefined); // no forced role — writes as the user's default role
-        assert.equal(c.warehouse, 'WEAVIX_AI_WH'); // dedicated telemetry warehouse
-        assert.equal(c.host, 'fpthfcq-lx42606.snowflakecomputing.com');
-    } finally {
-        fs.unlinkSync(p);
-    }
-});
-
-test('resolveConfig falls back to env when there is no file', () => {
-    const c = resolveConfig({
-        CLAUDE_SNOWFLAKE_CONFIG: path.join(os.tmpdir(), 'does-not-exist.json'),
-        SNOWFLAKE_ACCOUNT: 'fpthfcq-lx42606', SNOWFLAKE_USER: 'ada', SNOWFLAKE_PRIVATE_KEY_FILE: '/keys/ada.p8',
-    });
-    assert.equal(c.account, 'fpthfcq-lx42606');
-    assert.equal(c.keyFile, '/keys/ada.p8');
-});
-
-test('resolveConfig returns null when neither file nor env is set', () => {
-    const c = resolveConfig({ CLAUDE_SNOWFLAKE_CONFIG: path.join(os.tmpdir(), 'does-not-exist.json') });
-    assert.equal(c, null);
-});
-
 // --- Non-interactive / service-identity path (WV-3200) ---
-
-test('resolveConfig accepts an inline PEM key (no file needed)', () => {
-    const c = resolveConfig({
-        ...NO_FILE,
-        SNOWFLAKE_ACCOUNT: 'fpthfcq-lx42606', SNOWFLAKE_USER: 'svc', SNOWFLAKE_PRIVATE_KEY: FAKE_PEM,
-    });
-    assert.ok(c);
-    assert.equal(c.keyData, FAKE_PEM);
-    assert.equal(c.keyFile, undefined); // inline key means no file path
-    assert.equal(c.user, 'svc');
-});
-
-test('resolveConfig accepts a base64 inline key and decodes it', () => {
-    const c = resolveConfig({
-        ...NO_FILE,
-        SNOWFLAKE_ACCOUNT: 'fpthfcq-lx42606', SNOWFLAKE_USER: 'svc',
-        SNOWFLAKE_PRIVATE_KEY_B64: Buffer.from(FAKE_PEM, 'utf8').toString('base64'),
-    });
-    assert.equal(c.keyData, FAKE_PEM);
-});
-
-test('an inline key wins over a file path when both are set', () => {
-    const c = resolveConfig({
-        ...NO_FILE,
-        SNOWFLAKE_ACCOUNT: 'a', SNOWFLAKE_USER: 'svc',
-        SNOWFLAKE_PRIVATE_KEY_FILE: '/keys/svc.p8', SNOWFLAKE_PRIVATE_KEY: FAKE_PEM,
-    });
-    assert.equal(c.keyData, FAKE_PEM);
-    assert.equal(c.keyFile, undefined);
-});
-
-test('resolveConfig still returns null with an account/user but no key of any kind', () => {
-    const c = resolveConfig({ ...NO_FILE, SNOWFLAKE_ACCOUNT: 'a', SNOWFLAKE_USER: 'svc' });
-    assert.equal(c, null);
-});
-
-test('normalizePem restores literal \\n in a flattened key, leaves real newlines alone', () => {
-    const flat = '-----BEGIN PRIVATE KEY-----\\nMIIABC\\n-----END PRIVATE KEY-----';
-    assert.ok(normalizePem(flat).includes('\nMIIABC\n'));
-    assert.equal(normalizePem(FAKE_PEM), FAKE_PEM); // already has real newlines
-});
-
-test('resolveInlineKey prefers base64 over a raw value', () => {
-    const key = resolveInlineKey({}, {
-        SNOWFLAKE_PRIVATE_KEY: 'RAW', SNOWFLAKE_PRIVATE_KEY_B64: Buffer.from('B64', 'utf8').toString('base64'),
-    });
-    assert.equal(key, 'B64');
-});
-
-test('readPrivateKey returns the inline value without touching the filesystem', () => {
-    assert.equal(readPrivateKey({ keyData: FAKE_PEM, keyFile: '/nope/missing.p8' }), FAKE_PEM);
-});
 
 test('isNonInteractive: explicit override wins, CI markers auto-enable', () => {
     assert.equal(isNonInteractive({ CLAUDE_SF_SYNC: '1' }), true);
@@ -222,14 +111,6 @@ test('isNonInteractive: explicit override wins, CI markers auto-enable', () => {
     assert.equal(isNonInteractive({ CI: 'true' }), true);
     assert.equal(isNonInteractive({ GITHUB_ACTIONS: 'true' }), true);
     assert.equal(isNonInteractive({}), false); // interactive by default
-});
-
-test('shouldWriteSync: an inline key forces in-process write, even against CLAUDE_SF_SYNC=0', () => {
-    // Inline key must never be serialized into a detached child's env.
-    assert.equal(shouldWriteSync({ keyData: FAKE_PEM }, { CLAUDE_SF_SYNC: '0' }), true);
-    // File-based key follows the env decision.
-    assert.equal(shouldWriteSync({ keyFile: '/k.p8' }, { CI: 'true' }), true);
-    assert.equal(shouldWriteSync({ keyFile: '/k.p8' }, {}), false); // interactive -> detached
 });
 
 test('UserPromptSubmit -> prompt/submit, and NEVER captures prompt text', () => {
@@ -251,32 +132,6 @@ test('the schema has no column that could hold prompt/response content', () => {
 });
 
 // --- Batching / spool (WV: reduce Snowflake compute) ---
-
-test('buildBatchInsert packs many rows into one statement, row-major bindings', () => {
-    const rows = [toRow(build({ hook_event_name: 'SessionStart', session_id: 's1' })),
-        toRow(build({ hook_event_name: 'Stop', session_id: 's2' }))];
-    const { statement, bindings } = buildBatchInsert(rows, { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' });
-    // Two value tuples in one INSERT.
-    assert.equal((statement.match(/\(\?/g) || []).length, 2);
-    assert.equal((statement.match(/\?/g) || []).length, COLUMNS.length * 2);
-    assert.equal(Object.keys(bindings).length, COLUMNS.length * 2);
-    // Row-major: first row's SESSION_ID is binding 1, second row's is COLUMNS.length+1.
-    assert.equal(bindings['1'].value, 's1');
-    assert.equal(bindings[String(COLUMNS.length + 1)].value, 's2');
-});
-
-test('buildInsert (single event) still matches the one-tuple shape', () => {
-    const { statement, bindings } = buildInsert(build({ hook_event_name: 'SessionStart', session_id: 's1' }),
-        { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' });
-    assert.equal((statement.match(/\?/g) || []).length, COLUMNS.length);
-    assert.equal(Object.keys(bindings).length, COLUMNS.length);
-});
-
-test('buildBatchInsert keeps the injection guard on identifiers', () => {
-    assert.throws(() => buildBatchInsert([toRow(build({ hook_event_name: 'Stop' }))], {
-        database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'X; DROP TABLE Y',
-    }));
-});
 
 test('parseSpool round-trips rows and skips malformed / wrong-width lines', () => {
     const row = toRow(build({ hook_event_name: 'Stop', session_id: 's1' }));
@@ -400,116 +255,6 @@ function writeBatch(dir, name, rows) {
     return p;
 }
 const TARGET_CFG = { target: { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' } };
-
-test('flushBatches: on full success it deletes the files and batches rows into one post', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-ok-'));
-    try {
-        const rows = [toRow(build({ hook_event_name: 'SessionStart', session_id: 's1' })),
-            toRow(build({ hook_event_name: 'Stop', session_id: 's1' }))];
-        const f = writeBatch(dir, 'spool.ndjson.batch.a', rows);
-        let calls = 0; let seenStmt = '';
-        const fakePost = (cfg, stmt, bindings, cb) => { calls += 1; seenStmt = stmt; cb(true); };
-        let result;
-        flushBatches(TARGET_CFG, [f], 1000, ok => { result = ok; }, fakePost);
-        assert.equal(result, true);
-        assert.ok(!fs.existsSync(f)); // deleted after a durable write
-        assert.equal(calls, 1); // both rows in one statement
-        assert.equal((seenStmt.match(/\(\?/g) || []).length, 2);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test('flushBatches: on failure it retains the files and bumps their mtime (backoff)', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-fail-'));
-    try {
-        const f = writeBatch(dir, 'spool.ndjson.batch.a', [toRow(build({ hook_event_name: 'Stop', session_id: 's1' }))]);
-        // Age it well into the past so the post-failure bump is detectable.
-        const old = Date.now() - 10 * 60 * 1000;
-        fs.utimesSync(f, old / 1000, old / 1000);
-        const fakePost = (cfg, stmt, bindings, cb) => cb(false);
-        let result;
-        flushBatches(TARGET_CFG, [f], 1000, ok => { result = ok; }, fakePost);
-        assert.equal(result, false);
-        assert.ok(fs.existsSync(f)); // kept for retry
-        assert.ok(fs.statSync(f).mtimeMs > old + 60_000); // mtime moved forward -> retry grace resets
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test('flushBatches: empty/garbage files are cleaned up without any post', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-empty-'));
-    try {
-        const f = path.join(dir, 'spool.ndjson.batch.a');
-        fs.writeFileSync(f, 'not json\n\n');
-        let calls = 0;
-        const fakePost = () => { calls += 1; };
-        let result;
-        flushBatches(TARGET_CFG, [f], 1000, ok => { result = ok; }, fakePost);
-        assert.equal(result, true);
-        assert.equal(calls, 0); // nothing to send
-        assert.ok(!fs.existsSync(f)); // and the junk file is removed
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test('flushBatches: a batch over the chunk size is sent as multiple chunks, all deleted on success', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-multi-'));
-    try {
-        const rows = [];
-        for (let i = 0; i <= MAX_ROWS_PER_INSERT; i++) rows.push(toRow(build({ hook_event_name: 'Stop', session_id: `s${i}` })));
-        const f = writeBatch(dir, 'spool.ndjson.batch.a', rows); // MAX_ROWS_PER_INSERT + 1 rows
-        let calls = 0;
-        const fakePost = (cfg, stmt, bindings, cb) => { calls += 1; cb(true); };
-        let result;
-        flushBatches(TARGET_CFG, [f], 1000, ok => { result = ok; }, fakePost);
-        assert.equal(result, true);
-        assert.equal(calls, 2); // split into two chunks
-        assert.ok(!fs.existsSync(f)); // deleted only after every chunk landed
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test('flushBatches: a chunk failure aborts the remaining chunks and retains the batch', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-abort-'));
-    try {
-        const rows = [];
-        for (let i = 0; i <= MAX_ROWS_PER_INSERT; i++) rows.push(toRow(build({ hook_event_name: 'Stop', session_id: `s${i}` })));
-        const f = writeBatch(dir, 'spool.ndjson.batch.a', rows); // two chunks
-        let calls = 0;
-        const failingPost = (cfg, stmt, bindings, cb) => { calls += 1; cb(false); }; // the first chunk fails
-        let result;
-        flushBatches(TARGET_CFG, [f], 1000, ok => { result = ok; }, failingPost);
-        assert.equal(calls, 1); // aborted after the first failure — chunk 2 never attempted
-        assert.equal(result, false);
-        assert.ok(fs.existsSync(f)); // retained for a later retry
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test('flushBatches: a hanging POST is force-finalized at the wall-clock ceiling and retains the batch', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sf-flush-ceiling-'));
-    // The production ceiling timer is unref'd (in real use the in-flight socket keeps
-    // the loop alive); here the hanging post opens no socket, so hold the loop open.
-    let keepAlive;
-    try {
-        const f = writeBatch(dir, 'spool.ndjson.batch.a', [toRow(build({ hook_event_name: 'Stop', session_id: 's1' }))]);
-        const hangingPost = () => { keepAlive = setInterval(() => {}, 1000); };
-        // A 50ms hard ceiling must fire and finalize even though the POST never returns.
-        const result = await new Promise(resolve => {
-            flushBatches(TARGET_CFG, [f], 1000, ok => resolve(ok), hangingPost, 50);
-        });
-        assert.equal(result, false); // ceiling reports the flush as not fully landed
-        assert.ok(fs.existsSync(f)); // batch retained for retry, not dropped
-    } finally {
-        if (keepAlive) clearInterval(keepAlive);
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
 
 // --- Origin: repository / workflow / branch (data-repo V1.2 / V1.3) ---
 
@@ -670,23 +415,6 @@ test('buildEvent carries repository/workflow/branch/entrypoint/attended from ctx
     assert.equal(e.branch, 'main');
     assert.equal(e.entrypoint, 'cli');
     assert.equal(e.attended, false); // false is a meaningful value, not dropped
-});
-
-test('buildBatchInsert binds token columns FIXED and attended BOOLEAN (0 and false preserved)', () => {
-    const e = buildEvent({ hook_event_name: 'Stop', session_id: 's1' }, { ...CTX, attended: false });
-    Object.assign(e, { inputTokens: 0, outputTokens: 42, cacheCreation: 0, cacheRead: 7, model: 'claude-opus-4-8' });
-    const { bindings } = buildBatchInsert([toRow(e)], { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' });
-    const bind = col => bindings[String(COLUMNS.indexOf(col) + 1)];
-    assert.deepEqual(bind('INPUT_TOKENS'), { type: 'FIXED', value: '0' }); // 0, not null
-    assert.deepEqual(bind('OUTPUT_TOKENS'), { type: 'FIXED', value: '42' });
-    assert.deepEqual(bind('CACHE_READ_INPUT_TOKENS'), { type: 'FIXED', value: '7' });
-    assert.deepEqual(bind('SESSION_ATTENDED'), { type: 'BOOLEAN', value: 'false' }); // false, not null
-    assert.deepEqual(bind('SESSION_ID'), { type: 'TEXT', value: 's1' }); // everything else stays TEXT
-
-    // An event with no token columns binds them as null (still typed FIXED).
-    const base = build({ hook_event_name: 'SessionStart', session_id: 's2' });
-    const b2 = buildBatchInsert([toRow(base)], { database: 'WEAVIX_AI', schema: 'TELEMETRY', table: 'CLAUDE_CODE_EVENTS' }).bindings;
-    assert.deepEqual(b2[String(COLUMNS.indexOf('INPUT_TOKENS') + 1)], { type: 'FIXED', value: null });
 });
 
 // --- Copilot review hardening (PR 5717) ---

@@ -16,7 +16,7 @@ const { ParquetReader } = require('@dsnp/parquetjs');
 const {
     resolveBlobConfig, spoolPath, appendSpool, claimBatches, batchId, blobUrlFor,
     uploadBlob, flushParquetBatches, flushAll, logFailure, toRow, buildEvent, COLUMNS, PARQUET_COLUMN_TYPES,
-    PARQUET_ENTITY, MAX_ROWS_PER_PARQUET, ORPHAN_RETRY_AFTER_MS,
+    PARQUET_ENTITY, MAX_ROWS_PER_PARQUET, ORPHAN_RETRY_AFTER_MS, SPOOL_HOLD_MAX_BYTES,
 } = require('../src/telemetry.cjs');
 const { encodeParquet } = require('../dist/parquet-writer.cjs');
 
@@ -343,6 +343,43 @@ test('end to end: an unreachable endpoint keeps the batch and logs the failure',
     const log = fs.readFileSync(path.join(dir, 'errors.log'), 'utf8');
     assert.match(log, /parquet upload-failed/);
     assert.ok(!log.includes('SECRETSIG'));
+});
+
+test('end to end: an expired SAS holds events, and the first flush after renewal sends them all', async () => {
+    const dir = tmp();
+    const srv = await fakeBlobServer();
+    try {
+        const env = {
+            PATH: process.env.PATH, HOME: dir, USER: 'ada',
+            CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.parquet.ndjson'),
+            CLAUDE_SF_SYNC: '1',
+        };
+        const expired = `${srv.base}&se=2020-01-01T00%3A00%3A00Z`;
+        for (const id of ['old-1', 'old-2']) {
+            const r = await runHook({ ...env, CLAUDE_TELEMETRY_SAS_URL: expired }, { session_id: id, cwd: dir, hook_event_name: 'SessionEnd' });
+            assert.equal(r.code, 0);
+        }
+        assert.equal(srv.puts.length, 0);
+        assert.deepEqual(fs.readdirSync(dir).filter(f => f.includes('.batch.')), [], 'nothing claimed while expired');
+        assert.match(fs.readFileSync(path.join(dir, 'errors.log'), 'utf8'), /parquet sas-expired/);
+
+        await runHook({ ...env, CLAUDE_TELEMETRY_SAS_URL: srv.base }, { session_id: 'new-1', cwd: dir, hook_event_name: 'SessionEnd' });
+        assert.equal(srv.puts.length, 1);
+        assert.deepEqual((await readParquet(srv.puts[0].body)).map(r => r.SESSION_ID), ['old-1', 'old-2', 'new-1']);
+    } finally { await srv.close(); }
+});
+
+test('end to end: an expired SAS stops adding to a spool that has reached the hold cap', async () => {
+    const dir = tmp();
+    const sp = path.join(dir, 'spool.ada.parquet.ndjson');
+    fs.writeFileSync(sp, '');
+    fs.truncateSync(sp, SPOOL_HOLD_MAX_BYTES);
+    const r = await runHook({
+        PATH: process.env.PATH, HOME: dir, USER: 'ada', CLAUDE_SF_SPOOL: sp, CLAUDE_SF_SYNC: '1',
+        CLAUDE_TELEMETRY_SAS_URL: 'https://a.example/claude-telemetry?se=2020-01-01T00%3A00%3A00Z&sig=x',
+    }, { session_id: 'x', cwd: dir, hook_event_name: 'Stop' });
+    assert.equal(r.code, 0);
+    assert.equal(fs.statSync(sp).size, SPOOL_HOLD_MAX_BYTES);
 });
 
 test('end to end: no sink configured is a silent no-op', async () => {

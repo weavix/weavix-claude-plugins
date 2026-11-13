@@ -449,18 +449,6 @@ function toRow(event) {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 /**
  * Whether to write synchronously rather than via a detached child. A detached
  * writer is right for a long-lived interactive session (no added latency), but a
@@ -492,7 +480,11 @@ const SPOOL_MAX_BYTES = 128 * 1024;
 const ORPHAN_RETRY_AFTER_MS = 60 * 1000;
 // Give up on (delete) a batch that has failed to send for this long, bounding
 // disk use and stopping a poison batch from retrying forever.
-const ORPHAN_DROP_AFTER_MS = 24 * 60 * 60 * 1000;
+// Seven days, so batches held through an expired-SAS gap survive until the SAS is renewed.
+const ORPHAN_DROP_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+// While the SAS is expired nothing is claimed or uploaded and the spool keeps growing; past this
+// size new events are dropped, bounding disk use until the SAS is renewed.
+const SPOOL_HOLD_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * Absolute path to the append spool. Per OS user and under the system temp dir,
@@ -901,7 +893,8 @@ function main() {
             // Append the event to the machine-local spool; only when it is time, flush the whole
             // spool as one parquet upload. Most events just append and return in microseconds.
             const sp = spoolPath(process.env);
-            appendSpool(sp, toRow(event));
+            const sizeOf = () => { try { return fs.statSync(sp).size; } catch { return 0; } };
+            if (!blob.expired || sizeOf() < SPOOL_HOLD_MAX_BYTES) appendSpool(sp, toRow(event));
 
             // The turn's tokens are now durably in the spool (its own retry owns delivery), so
             // advance the offset once here -- committing only after a deferred flush would let
@@ -911,9 +904,14 @@ function main() {
                 commitTokenOffset(event._tokenCommit.sessionId, event._tokenCommit.offset, event._tokenCommit.carry);
             }
 
-            let size = 0;
-            try { size = fs.statSync(sp).size; } catch { /* raced away by a peer flush */ }
-            if (!shouldFlush(size, event.hookEvent)) process.exit(0);
+            if (!shouldFlush(sizeOf(), event.hookEvent)) process.exit(0);
+
+            // Expired SAS: hold everything in the spool, unclaimed, so no batch ages toward the
+            // drop window before the SAS is renewed; the first flush after renewal sends it all.
+            if (blob.expired) {
+                logFailure(process.env, 'parquet', 'sas-expired');
+                process.exit(0);
+            }
 
             const files = claimBatches(sp, Date.now(), crypto.randomUUID());
             if (!files.length) process.exit(0);
@@ -940,7 +938,7 @@ if (require.main === module) main();
 module.exports = {
     buildEvent, toRow, isNonInteractive, COLUMNS,
     spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches,
-    SPOOL_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
+    SPOOL_MAX_BYTES, SPOOL_HOLD_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
     repoFromRemote, resolveOrigin, turnTokens, initTokenOffset, commitTokenOffset,
     originCacheFile, cleanupSessionState, usageInt, MIN_ROW_WIDTH, STATE_RETENTION_MS,
     resolveBlobConfig, blobConfigFilePath, batchId, blobUrlFor, uploadBlob,

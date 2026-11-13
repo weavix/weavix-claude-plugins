@@ -53,8 +53,8 @@ CI is detected automatically and flushes in-process before the job exits.
 
 - **Capture:** each hook event becomes one metadata row, appended to a spool file under the system temp dir.
 - **Flush:** on `SessionEnd`, or when the spool passes 128 KB, the batch is encoded as parquet and uploaded to `<sas path>/claudecodeevents/<batch id>-<part>.parquet`.
-- **Credentials:** the SAS is container-scoped, create-only (`sp=c`) on the dedicated `claude-telemetry` container in `weavixdataplatformprodsa`. It cannot read, list, overwrite or delete, and cannot reach the `parquet` container other pipes ingest. A SAS past its `se` expiry counts as unconfigured: the guard blocks and uploads pause until setup is re-run.
-- **Retries:** a failed upload keeps its batch, which is retried after 60 s and dropped after 24 h. Blob names are fixed per batch and uploads use `If-None-Match: *`, so a retry never duplicates rows.
+- **Credentials:** the SAS is container-scoped, create-only (`sp=c`) on the dedicated `claude-telemetry` container in `weavixdataplatformprodsa`. It cannot read, list, overwrite or delete, and cannot reach the `parquet` container other pipes ingest. A SAS past its `se` expiry counts as unconfigured: the guard blocks, and events are held in the spool (up to 16 MB) and sent by the first flush after setup is re-run.
+- **Retries:** a failed upload keeps its batch, which is retried after 60 s and dropped after 7 days. Blob names are fixed per batch and uploads use `If-None-Match: *`, so a retry never duplicates rows.
 - **Errors:** failures are written to `errors.log` beside the spool. That log holds the HTTP status or reason only, never the URL.
 - **Ingest:** Snowpipe `TELEMETRY.CLAUDE_CODE_EVENTS_PIPE` loads straight from the container, defined in the data repo under `migrations/ai/telemetry`. There is no compactor in between.
 

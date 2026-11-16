@@ -854,6 +854,38 @@ function flushAll(blob, files, limits, done) {
     });
 }
 
+/**
+ * Whether this session's first prompt arrived without a SessionStart: no token baseline exists
+ * yet. Some clients (seen in Claude Desktop) skip a plugin's SessionStart hook; this stands in.
+ * @param {Record<string, any>} payload hook payload
+ */
+function needsInferredStart(payload) {
+    if (payload.hook_event_name !== 'UserPromptSubmit' || !payload.session_id) return false;
+    try { fs.statSync(tokenStateFile(payload.session_id)); return false; } catch { return true; }
+}
+
+/**
+ * Whether the project still runs the legacy repo hook (.claude/hooks/snowflake-telemetry.cjs)
+ * and that hook would write, in which case this plugin stays silent so a session is not counted
+ * twice. The project is CLAUDE_PROJECT_DIR, else the nearest ancestor of cwd holding the hook.
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} [cwd] session working directory
+ */
+function legacyHookActive(env, cwd) {
+    const rel = path.join('.claude', 'hooks', 'snowflake-telemetry.cjs');
+    let found = false;
+    if (env.CLAUDE_PROJECT_DIR) found = fs.existsSync(path.join(env.CLAUDE_PROJECT_DIR, rel));
+    if (!found && cwd) {
+        for (let dir = path.resolve(cwd); ; dir = path.dirname(dir)) {
+            if (fs.existsSync(path.join(dir, rel))) { found = true; break; }
+            if (path.dirname(dir) === dir) break;
+        }
+    }
+    if (!found) return false;
+    const cfg = env.CLAUDE_SNOWFLAKE_CONFIG || path.join(os.homedir(), '.snowflake', 'claude-telemetry.json');
+    return fs.existsSync(cfg) || Boolean(env.SNOWFLAKE_ACCOUNT && env.SNOWFLAKE_USER);
+}
+
 function main() {
     // Child mode: the detached flusher spawned below. Upload the claimed batches and exit; it
     // owns deleting them on success or leaving them to retry.
@@ -884,7 +916,8 @@ function main() {
         } catch {
             process.exit(0);
         }
-        const event = buildEvent(payload, {
+        if (legacyHookActive(process.env, payload.cwd)) process.exit(0);
+        const ctx = {
             host: os.hostname(),
             // In CI/cloud there is no login user; attribute to an explicit actor
             // (the service identity or the human who triggered the run) when given.
@@ -898,14 +931,21 @@ function main() {
             // repository / workflow / branch: env in CI, git checkout locally (repository
             // cached per session; see resolveOrigin).
             ...resolveOrigin(process.env, payload.cwd, payload.session_id),
-        });
+        };
+        const inferredStart = needsInferredStart(payload)
+            ? buildEvent({ ...payload, hook_event_name: 'SessionStart', source: 'inferred' }, ctx)
+            : null;
+        const event = buildEvent(payload, ctx);
 
         try {
             // Append the event to the machine-local spool; only when it is time, flush the whole
             // spool as one parquet upload. Most events just append and return in microseconds.
             const sp = spoolPath(process.env);
             const sizeOf = () => { try { return fs.statSync(sp).size; } catch { return 0; } };
-            if (!blob.expired || sizeOf() < SPOOL_HOLD_MAX_BYTES) appendSpool(sp, toRow(event));
+            if (!blob.expired || sizeOf() < SPOOL_HOLD_MAX_BYTES) {
+                if (inferredStart) appendSpool(sp, toRow(inferredStart));
+                appendSpool(sp, toRow(event));
+            }
 
             // The turn's tokens are now durably in the spool (its own retry owns delivery), so
             // advance the offset once here -- committing only after a deferred flush would let
@@ -947,7 +987,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-    buildEvent, toRow, isNonInteractive, COLUMNS,
+    buildEvent, toRow, isNonInteractive, COLUMNS, needsInferredStart, legacyHookActive,
     spoolPath, appendSpool, parseSpool, shouldFlush, chunk, claimBatches,
     SPOOL_MAX_BYTES, SPOOL_HOLD_MAX_BYTES, ORPHAN_RETRY_AFTER_MS, ORPHAN_DROP_AFTER_MS,
     repoFromRemote, resolveOrigin, turnTokens, initTokenOffset, commitTokenOffset,

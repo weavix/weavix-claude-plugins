@@ -16,7 +16,7 @@ const { ParquetReader } = require('@dsnp/parquetjs');
 const {
     resolveBlobConfig, spoolPath, appendSpool, claimBatches, batchId, blobUrlFor,
     uploadBlob, flushParquetBatches, flushAll, logFailure, toRow, buildEvent, COLUMNS, PARQUET_COLUMN_TYPES,
-    PARQUET_ENTITY, MAX_ROWS_PER_PARQUET, ORPHAN_RETRY_AFTER_MS, SPOOL_HOLD_MAX_BYTES,
+    PARQUET_ENTITY, MAX_ROWS_PER_PARQUET, ORPHAN_RETRY_AFTER_MS, SPOOL_HOLD_MAX_BYTES, legacyHookActive,
 } = require('../src/telemetry.cjs');
 const { encodeParquet } = require('../dist/parquet-writer.cjs');
 
@@ -384,6 +384,81 @@ test('end to end: an expired SAS stops adding to a spool that has reached the ho
     }, { session_id: 'x', cwd: dir, hook_event_name: 'Stop' });
     assert.equal(r.code, 0);
     assert.equal(fs.statSync(sp).size, SPOOL_HOLD_MAX_BYTES);
+});
+
+/** Hook env that spools without uploading: in-process flush to an unreachable loopback URL. */
+function spoolOnlyEnv(dir, extra = {}) {
+    return {
+        PATH: process.env.PATH, HOME: dir, USER: 'ada',
+        CLAUDE_SF_SPOOL: path.join(dir, 'spool.ada.parquet.ndjson'),
+        CLAUDE_TELEMETRY_SAS_URL: 'http://127.0.0.1:1/claude-telemetry?sig=x',
+        ...extra,
+    };
+}
+
+/** Rows currently in the live spool, as { hook, source, input } objects. */
+function spooled(dir) {
+    const f = path.join(dir, 'spool.ada.parquet.ndjson');
+    if (!fs.existsSync(f)) return [];
+    return fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map(l => {
+        const r = JSON.parse(l);
+        return { hook: r[COLUMNS.indexOf('HOOK_EVENT')], source: r[COLUMNS.indexOf('SOURCE')], input: r[COLUMNS.indexOf('INPUT_TOKENS')] };
+    });
+}
+
+test('end to end: a first prompt with no SessionStart records an inferred start and counts the first turn', async () => {
+    const dir = tmp();
+    const transcript = path.join(dir, 't.jsonl');
+    const sid = `inferred-${Date.now()}`;
+    fs.writeFileSync(transcript, JSON.stringify({ type: 'user', message: { content: 'hi' } }) + '\n');
+    const env = spoolOnlyEnv(dir);
+    const base = { session_id: sid, cwd: dir, transcript_path: transcript };
+    await runHook(env, { ...base, hook_event_name: 'UserPromptSubmit' });
+    fs.appendFileSync(transcript, JSON.stringify({ timestamp: '2026-11-16T00:00:01Z', message: { id: 'm1', model: 'claude-opus-5-5', usage: { input_tokens: 42, output_tokens: 7 } } }) + '\n');
+    await runHook(env, { ...base, hook_event_name: 'Stop' });
+    await runHook(env, { ...base, hook_event_name: 'UserPromptSubmit' });
+    assert.deepEqual(spooled(dir), [
+        { hook: 'SessionStart', source: 'inferred', input: null },
+        { hook: 'UserPromptSubmit', source: null, input: null },
+        { hook: 'Stop', source: null, input: 42 },
+        { hook: 'UserPromptSubmit', source: null, input: null },
+    ]);
+});
+
+test('end to end: a session that did fire SessionStart gets no inferred start', async () => {
+    const dir = tmp();
+    const transcript = path.join(dir, 't.jsonl');
+    fs.writeFileSync(transcript, '');
+    const env = spoolOnlyEnv(dir);
+    const base = { session_id: `real-${Date.now()}`, cwd: dir, transcript_path: transcript };
+    await runHook(env, { ...base, hook_event_name: 'SessionStart', source: 'startup' });
+    await runHook(env, { ...base, hook_event_name: 'UserPromptSubmit' });
+    assert.deepEqual(spooled(dir).map(r => `${r.hook}:${r.source}`), ['SessionStart:startup', 'UserPromptSubmit:null']);
+});
+
+test('end to end: stays silent in a checkout whose legacy hook would write', async () => {
+    const dir = tmp();
+    const repo = path.join(dir, 'repo');
+    fs.mkdirSync(path.join(repo, '.claude', 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.claude', 'hooks', 'snowflake-telemetry.cjs'), '');
+    fs.mkdirSync(path.join(repo, 'sub'));
+    const cfg = path.join(dir, 'sf.json');
+    fs.writeFileSync(cfg, '{}');
+    const payload = { session_id: 'legacy', cwd: path.join(repo, 'sub'), hook_event_name: 'UserPromptSubmit' };
+    await runHook(spoolOnlyEnv(dir, { CLAUDE_SNOWFLAKE_CONFIG: cfg }), payload);
+    assert.deepEqual(spooled(dir), [], 'legacy hook configured: plugin silent');
+    await runHook(spoolOnlyEnv(dir, { CLAUDE_SNOWFLAKE_CONFIG: path.join(dir, 'none.json') }), payload);
+    assert.ok(spooled(dir).length > 0, 'legacy hook present but unconfigured: plugin reports');
+});
+
+test('legacyHookActive honours CLAUDE_PROJECT_DIR and needs a Snowflake connector', () => {
+    const dir = tmp();
+    fs.mkdirSync(path.join(dir, '.claude', 'hooks'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude', 'hooks', 'snowflake-telemetry.cjs'), '');
+    const none = { CLAUDE_SNOWFLAKE_CONFIG: path.join(dir, 'none.json') };
+    assert.equal(legacyHookActive({ ...none, CLAUDE_PROJECT_DIR: dir }, '/'), false);
+    assert.equal(legacyHookActive({ ...none, CLAUDE_PROJECT_DIR: dir, SNOWFLAKE_ACCOUNT: 'a', SNOWFLAKE_USER: 'u' }, '/'), true);
+    assert.equal(legacyHookActive({ ...none, SNOWFLAKE_ACCOUNT: 'a', SNOWFLAKE_USER: 'u' }, tmp()), false);
 });
 
 test('end to end: no sink configured is a silent no-op', async () => {

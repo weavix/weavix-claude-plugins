@@ -1,0 +1,7 @@
+{
+  "extraKnownMarketplaces": {
+    "weavix": { "source": { "source": "github", "repo": "weavix/weavix-claude-plugins" } }
+  },
+  "enabledPlugins": { "claude-telemetry@weavix": true },
+  "env": { "CLAUDE_TELEMETRY_SAS_URL": "<value of CLAUDE-TELEMETRY-SAS-URL in wv-prod-secrets>" }
+}

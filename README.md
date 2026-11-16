@@ -10,6 +10,16 @@ Claude Code plugin marketplace for weavix. Add it once and every Claude Code ses
 
 ## Enabling it
 
+### Org-wide (how weavix runs it)
+
+A claude.ai organization Owner pastes [`managed-settings/claude-code.json`](managed-settings/claude-code.json) into **claude.ai → Organization settings → Claude Code → Managed settings**, replacing the placeholder with the value of `CLAUDE-TELEMETRY-SAS-URL` from `wv-prod-secrets`. If managed settings already exist there, merge these three keys into them rather than replacing the whole document: the page holds one config for the whole org.
+
+- **Who it reaches:** every org member's Claude Code (terminal and the desktop app's Code tab), in any folder, with no install or setup. Claude Code fetches it at startup and hourly, and it outranks repo and user settings.
+- **Who it skips:** sessions signed in with an API key or another provider (`ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_*`), and claude.ai chat, which has no hooks. Cloud sessions get managed hooks but may not install plugins, so they are not guaranteed to report.
+- **The upload URL** is create-only on its own container, so having it in every member's settings lets them add telemetry files and nothing else. Rotate it by updating the vault secret and this page together.
+
+### Per repo
+
 In a repo, add to `.claude/settings.json`:
 
 ```json
@@ -24,7 +34,7 @@ In a repo, add to `.claude/settings.json`:
 
 `CLAUDE_TELEMETRY_REQUIRED=1` turns on the guard: file edits are blocked until telemetry is configured. Leave it out where you only want reporting.
 
-For every session on a machine regardless of repo, put the same `extraKnownMarketplaces` and `enabledPlugins` in `~/.claude/settings.json`.
+Outside the org-wide settings, put the same `extraKnownMarketplaces` and `enabledPlugins` in `~/.claude/settings.json` for every session on one machine.
 
 ## Configuring a machine
 
@@ -34,10 +44,9 @@ bash "<plugin root>/scripts/setup.sh"
 
 When the guard is on, Claude prints the exact command. It reads the upload URL from Key Vault (`wv-prod-secrets` / `CLAUDE-TELEMETRY-SAS-URL`, needs `az login` and read access) and writes `~/.claude/telemetry.json` (mode 0600).
 
-CI and cloud agents set the URL as a secret env var instead. This repo is internal, so a job's own `GITHUB_TOKEN` cannot clone it; point git at a read-only token first:
+CI and cloud agents set the URL as a secret env var instead:
 
 ```yaml
-- run: git config --global url."https://x-access-token:${{ secrets.CLAUDE_PLUGINS_READ_TOKEN }}@github.com/weavix/weavix-claude-plugins".insteadOf "https://github.com/weavix/weavix-claude-plugins"
 - uses: anthropics/claude-code-action@v1
   env:
     CLAUDE_TELEMETRY_SAS_URL: ${{ secrets.CLAUDE_TELEMETRY_SAS_URL }}
@@ -79,7 +88,7 @@ az storage container generate-sas --account-name weavixdataplatformprodsa --name
   --permissions c --expiry "$(date -u -v+1y +%Y-%m-%dT%H:%MZ)" --https-only --auth-mode key -o tsv
 ```
 
-Store `https://weavixdataplatformprodsa.blob.core.windows.net/claude-telemetry?<sas>` as `CLAUDE-TELEMETRY-SAS-URL` in `wv-prod-secrets`, and as the `CLAUDE_TELEMETRY_SAS_URL` GitHub secret. Machines pick it up the next time they run `setup.sh`.
+Store `https://weavixdataplatformprodsa.blob.core.windows.net/claude-telemetry?<sas>` as `CLAUDE-TELEMETRY-SAS-URL` in `wv-prod-secrets`, as the `CLAUDE_TELEMETRY_SAS_URL` GitHub secret, and in the org managed settings. Managed settings reach every machine within an hour; machines configured by `setup.sh` pick it up when they re-run it.
 
 ## Developing
 
